@@ -13,6 +13,19 @@ user:     ssh d-xxx@relay.example.com            # root on the device
           ssh json@relay.example.com             # machine-readable status (JSON)
 ```
 
+Public key auth: an SSH signature binds the session it was made on, so the
+relay cannot replay your key to the device. Instead it forwards your agent:
+load your key (`ssh-add ~/.ssh/key`) and connect with `-A`:
+
+```
+ssh -A -i ~/.ssh/key d-xxx@relay.example.com
+```
+
+The device still verifies your real key against its `authorized_keys`; the
+private key never leaves your machine. Without `-A` the session is refused
+with a hint; password auth needs `-o PubkeyAuthentication=no` once the relay
+has accepted a key.
+
 Design docs: [PLAN.md](PLAN.md) (requirements, milestones, testing) and
 [ARCHITECTURE.md](ARCHITECTURE.md) (two-phase SSH design, policy model,
 limits, security model).
@@ -50,5 +63,5 @@ exits on `Ctrl+C`/`Ctrl+D`, which tears the tunnel down.
 
 - M0–M5 implemented and covered by unit, protocol, in-process integration
   tests and a real-OpenSSH e2e (`test/e2e/run.sh`).
-- M6 (stretch): agent-forwarding pubkey pass-through, X11 hardening, admin
-  listing, alias reclaim tokens, metrics.
+- M6 (stretch): pubkey pass-through via agent forwarding (**shipped**), X11
+  hardening, admin listing, alias reclaim tokens, metrics.

@@ -38,7 +38,7 @@ var envAllowlist = map[string]bool{"TERM": true, "LANG": true}
 // session: requests are mirrored (with policy gates), data flows through
 // throttled pumps, exit status maps back (255 when the device never sent
 // one), and stderr keeps its extended-data type.
-func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs <-chan *ssh.Request, ca stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
+func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs <-chan *ssh.Request, ca *stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
 	// A raw session channel (not ssh.Session) so we can read the device's
 	// exit-status/exit-signal requests ourselves.
 	devCh, devReqs, err := ca.dev.OpenChannel("session", nil)

@@ -27,6 +27,7 @@ Build `relay`, a standalone SSH forwarding relay:
 | Device (register, auto ID) | `ssh -R 0:127.0.0.1:22 ssh@relay.example.com` | Relay prints the connect command: `ssh d-XXXXXXXXXX@relay.example.com` |
 | Device (register, custom name) | `ssh -R custom-name:0:127.0.0.1:22 ssh@relay.example.com` | Binding `custom-name` → `127.0.0.1:22` |
 | User (default user is `root`) | `ssh d-XXXXXXXXXX@relay.example.com` | SSH session to the device as `root` |
+| User (public key) | `ssh -A -i ~/.ssh/key deploy+d-XXXXXXXXXX@relay.example.com` | The relay forwards the user's ssh-agent; the device verifies the real key (agent forwarding required — signatures are session-bound) |
 | User (custom device user) | `ssh <user>+d-XXXXXXXXXX@relay.example.com` | SSH session to the device as `<user>` |
 | User (custom binding name) | `ssh <user>+custom-name@relay.example.com` | SSH session via the named binding |
 | User (SOCKS / dynamic forward) | `ssh -D 1080 user+alias@relay.example.com` | Allowed — destinations are dialed by the device, not the relay |
@@ -344,7 +345,11 @@ complete), M6 = stretch.
   startup; a failed reload keeps the last good policy.
 
 ### M6 — Stretch
-- Public-key pass-through via OpenSSH agent forwarding (`ssh -A`).
+- ~~Public-key pass-through via OpenSSH agent forwarding (`ssh -A`).~~
+  **Shipped.** The relay verifies the client's key signature itself, defers
+  the device login to the first session/forwarding open, and completes it
+  through the forwarded agent (ARCHITECTURE §5.2.1). Covered by in-process
+  integration tests and the real-OpenSSH e2e.
 - X11 hardening beyond verbatim pairing (per-display policies, cookie audit).
 - `ssh keys@relay…` admin listing of live bindings.
 - Alias reclaim tokens (prove ownership to steal back a name), optional
@@ -359,7 +364,7 @@ complete), M6 = stretch.
 |---|---|---|
 | Unit | bw parser, username grammar, registry concurrency, fail2ban arithmetic, IP limiter, policy gates, policy layer-merge + CIDR matching + hot-reload swap, JSON status document schema | `go test -race`, table-driven |
 | Protocol | request mirroring, refusal texts, exit-status mapping | in-process fake device (x/crypto/ssh both ends) |
-| E2E | real OpenSSH everywhere | `test/e2e` docker compose: `relay`, `device` (sshd, password auth), `client`; scenarios E1–E13: auto-ID, custom alias, `user+alias`, exec+exit code, client `-L`/`-D` through the bridge, refusal warning (device-role `-L`/`-D`, real-port `-R`), sftp gate, scp gate, x11 gate, IP limit, fail2ban ban, policy override (`--allow-tcp-forwarding=false`, `custom_policies` CIDR-scoped change + hot reload), JSON endpoints (`json@` status quota matches limiter; `ssh+json -R` output contains the new binding) |
+| E2E | real OpenSSH everywhere | `test/e2e` docker compose: `relay`, `device` (sshd, password auth), `client`; scenarios E1–E13: auto-ID, custom alias, `user+alias`, exec+exit code, client `-L`/`-D` through the bridge, refusal warning (device-role `-L`/`-D`, real-port `-R`), sftp gate, scp gate, x11 gate, IP limit, fail2ban ban, policy override (`--allow-tcp-forwarding=false`, `custom_policies` CIDR-scoped change + hot reload), JSON endpoints (`json@` status quota matches limiter; `ssh+json -R` output contains the new binding); E14–E15: pubkey via `ssh -A` + real ssh-agent (bridge exec) and agentless pubkey rejected with the `-A` hint |
 | Perf | bw limiter overhead, 100 concurrent bridges | scripted throughput/run-time checks, not CI-gated |
 | Static | vet, lint, `gofumpt`, staticcheck | golangci-lint in CI |
 
@@ -372,12 +377,13 @@ job on tag.
 
 1. **Auth model = pass-through.** The relay terminates the client's SSH and
    performs its own SSH handshake to the device through the tunnel, forwarding
-   the user's credentials (none → password). Public-key pass-through is
-   cryptographically impossible without the user's key (signatures bind the
-   session ID), so pubkey users go through agent forwarding in M6 — see
-   ARCHITECTURE §5. This is the single biggest design commitment; if you wanted
-   "relay must never see passwords", the alternative is M6's provisioned relay
-   key (`authorized_keys` on the device) — flag it now if so.
+   the user's credentials (none → password). Public-key signatures bind the
+   session ID, so the client's signature cannot be replayed to the device;
+   pubkey users go through agent forwarding instead (shipped — the user's own
+   agent signs the device's challenge, ARCHITECTURE §5.2.1). This is the
+   single biggest design commitment; if you wanted "relay must never see
+   passwords", the alternative is a provisioned relay key
+   (`authorized_keys` on the device) — flag it now if so.
 2. **Flag defaults:** `fail2ban=true`, `allow-sftp=true`, `allow-scp=true`,
    `allow-x11-forwarding=false`, `listen-port=2222`. Trivial to flip.
 3. **`--bw-limit` is per connection, per direction** (a global cap would let one

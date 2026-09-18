@@ -76,11 +76,13 @@ SSH connection types; the relay never opens a data port per binding.
 - The client sees the relay's host key, never the device's. Fine for a public
   relay service; the device's host key is verified by the relay's client
   handshake in TOFU/log-only mode (§11).
-- Public-key pass-through is impossible without the user's private key: an
-  `publickey` signature binds the *session ID* of the connection it was made
-  on, so a signature made against the relay is invalid at the device. Password
-  and keyboard-interactive credentials, however, forward cleanly. This drives
-  the auth model in §5.
+- Public-key pass-through cannot replay the client's signature: a `publickey`
+  signature binds the *session ID* of the connection it was made on, so a
+  signature made against the relay is invalid at the device. The shipped
+  solution is agent forwarding (§5.2): the user's own ssh-agent signs the
+  **device's** challenge, so the device still verifies the user's real key and
+  the private key never leaves the client. Password and keyboard-interactive
+  credentials forward cleanly as before. This drives the auth model in §5.
 
 **Rejected alternative:** allocate a real TCP port per device (frp/boringproxy
 style) and document `ssh -p <port> root@relay…`. Works, trivially transparent,
@@ -286,8 +288,27 @@ does not make a relay-local decision; it *performs the device login*:
 | `none` | try device `none` (passwordless sshd) | respond auth-failure to client (client falls through to password) |
 | `password` | try device `password` with the received password | respond auth-failure; count for fail2ban |
 | `keyboard-interactive` | collect answers, try device `password` then `keyboard-interactive` | same |
-| `publickey` | reject in v1 (see §2); M6: use forwarded agent (`auth-agent-req@openssh.com`) to sign the device's challenge | — |
+| `publickey` | accept the key (x/crypto verifies the client's signature over the relay session ID) and **defer** the device login: at the first session/forwarding open, the relay opens `auth-agent@openssh.com` back to the client and the forwarded agent signs the device's challenge (§5.2) | session/forward open rejected with the reason; agentless key = `-A` hint (never counts for fail2ban), device refusal = fail2ban failure |
 | `hostbased` | reject | — |
+
+#### 5.2.1 Deferred publickey login (agent pass-through)
+
+1. **Auth phase.** The relay's `PublicKeyCallback` records the verified client
+   key and reserves a bridge slot; **no device dial happens** — the agent
+   channel only exists once the client's session setup starts. A missing
+   tunnel or full bridge slot still rejects here, so the client falls back to
+   password auth exactly like before.
+2. **Completion phase.** When the client opens a `session` or `direct-tcpip`
+   channel, the relay opens `auth-agent@openssh.com` toward the client
+   (openssh answers it when `-A`/`ForwardAgent` is on — also with `-N`), lists
+   the agent's signers, orders the client-authenticated key first, and dials
+   the device with those publickeys. The agent channel stays open until the
+   handshake finishes: signature requests arrive mid-handshake. The device
+   applies its own `authorized_keys` policy — the relay adds no trust.
+3. **Failure mapping.** No agent / empty keyring → the open is rejected with
+   the `-A` + `ssh-add` hint (user setup mistake, never a fail2ban failure);
+   the device refusing every offered key → rejected with the `authorized_keys`
+   hint and counted as a credential failure.
 
 Implementation notes:
 
@@ -296,8 +317,11 @@ Implementation notes:
   sshd never sees concurrent auth games on one connection.
 - Passwords live only in flight (goroutine stack); never logged, never stored.
 - Because auth success = device login success, relay-side auth and bridge
-  establishment are the same step; there is no window where an "authenticated"
-  client has no device session.
+  establishment are the same step for none/password/keyboard-interactive —
+  there is no window where an "authenticated" client has no device session.
+  Publickey is the one deferred exception (§5.2.1): the login completes at the
+  first session/forwarding open, where a failure surfaces as a channel-open
+  rejection instead of an auth failure.
 
 ### 5.3 Session request mirroring
 
@@ -316,7 +340,7 @@ matches common `ssh` behavior, keeps pairing simple). Requests are mirrored
 | `signal` | mirror (INT, TERM, HUP, KILL, QUIT, USR1, USR2) |
 | `window-change` | mirror |
 | `break` | ignore + ok |
-| `auth-agent-req@openssh.com` | accept & retain channel (M6 pubkey path; harmless otherwise) |
+| `auth-agent-req@openssh.com` | accept (the client asking for agent forwarding; the relay drives the channel itself in the pubkey path, §5.2.1) |
 | unknown requests | reply `failure`, never forward |
 
 Gate references above resolve through the connection's **effective policy**
@@ -379,12 +403,12 @@ requests.
 
 | Incoming | Gate | Behavior |
 |---|---|---|
-| channel open `session` | alias live + caps | bridge (§5) |
-| channel open `direct-tcpip` (`-L`, `-D`) | `--allow-tcp-forwarding` (effective, §6.3) + channel cap | mirror as `direct-tcpip` on the Phase-2 device connection (device dials); splice with throttle; device-side open failures relayed back verbatim; when gated off, refusal with `[WARNING] TCP forwarding is not supported.` |
+| channel open `session` | alias live + caps | bridge (§5); pubkey connections complete the deferred agent login first (§5.2.1) — an open rejection carries the reason |
+| channel open `direct-tcpip` (`-L`, `-D`) | `--allow-tcp-forwarding` (effective, §6.3) + channel cap | mirror as `direct-tcpip` on the Phase-2 device connection (device dials); splice with throttle; device-side open failures relayed back verbatim; when gated off, refusal with `[WARNING] TCP forwarding is not supported.`; pubkey connections complete the deferred agent login here as well |
 | global `tcpip-forward` (`-R <port>:…` from the client) | **denied** | request-failure, reason `[WARNING] TCP forwarding is not supported.` |
 | global `cancel-tcpip-forward` | — | ack, no-op |
 | channel open `x11` | `--allow-x11-forwarding` | client-initiated opens never occur; device-initiated x11 opens are paired back to the client when the gate allows (drain loop, client.go) |
-| channel open `auth-agent@openssh.com` | — | accept (M6), else deny |
+| channel open `auth-agent@openssh.com` | — | client-initiated opens are drained (some clients open it themselves); pubkey connections open it toward the client in the deferred login (§5.2.1) |
 
 ### 6.2 Device connection (control, `ssh@…`)
 

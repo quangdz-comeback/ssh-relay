@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -62,7 +63,21 @@ func (s *Server) buildStatusDoc(ip string, excludeSelf bool, eff policy.Effectiv
 			BridgesMax:         b.MaxBridges,
 		})
 	}
-	return json.MarshalIndent(doc, "", "  ")
+	return marshalStatusDoc(doc)
+}
+
+// marshalStatusDoc encodes the document without HTML escaping (Go's default
+// json.Marshal would turn `<user>` into `\u003cuser\u003e`) and without the
+// encoder's trailing newline (call sites add their own line ending).
+func marshalStatusDoc(doc statusDoc) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(doc); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
 func listenAddressLabel(addr string) string {

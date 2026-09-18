@@ -6,7 +6,6 @@ package server
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -67,16 +66,22 @@ type Server struct {
 	wg        sync.WaitGroup
 }
 
-// stashedAuth is the device-side SSH client established during the end
-// user's pass-through authentication, together with the device connection's
-// inbound channel/request streams (x11 opens, keepalives).
+// stashedAuth is the end user's pass-through device login: either a ready
+// device-side SSH client (none/password/keyboard-interactive paths, established
+// during the client's authentication) or a pending public key that is
+// completed lazily via the client's forwarded agent (M6 pubkey pass-through).
 type stashedAuth struct {
+	mu         sync.Mutex
 	dev        *ssh.Client
 	devChans   <-chan ssh.NewChannel
 	devReqs    <-chan *ssh.Request
 	binding    *registry.Binding
 	deviceUser string
-	at         time.Time
+	// pubkey != nil means the client authenticated with this key but the
+	// device login is still pending; it completes in ensureUpstream through
+	// the client's forwarded ssh-agent (the key never leaves the client).
+	pubkey ssh.PublicKey
+	at     time.Time
 }
 
 // New builds a Server.
@@ -250,7 +255,7 @@ func (s *Server) serverConfig() *ssh.ServerConfig {
 			case RoleDevice, RoleDeviceJSON, RoleStatus:
 				return &ssh.Permissions{}, nil
 			case RoleClient:
-				return nil, errors.New("public key auth cannot pass through the relay; use password or keyboard-interactive")
+				return s.authClientPubkey(md, cls, key)
 			}
 			return nil, fmt.Errorf("unsupported role")
 		},
@@ -295,7 +300,7 @@ func (s *Server) authClient(md ssh.ConnMetadata, cls Classification, password st
 	s.deps.Ban.Success(sourceIPString(md.RemoteAddr()))
 
 	id := base64.RawStdEncoding.EncodeToString(md.SessionID())
-	s.authStash.Store(id, stashedAuth{
+	s.authStash.Store(id, &stashedAuth{
 		dev:        dev,
 		devChans:   devChans,
 		devReqs:    devReqs,
@@ -308,14 +313,43 @@ func (s *Server) authClient(md ssh.ConnMetadata, cls Classification, password st
 	return &ssh.Permissions{}, nil
 }
 
-// popAuth takes the stashed device client for this connection.
-func (s *Server) popAuth(sc *ssh.ServerConn) (stashedAuth, bool) {
+// authClientPubkey accepts an end user's public key. Signatures bind the
+// session ID, so the client's signature over the relay's session ID cannot be
+// replayed to the device (ARCHITECTURE §5); instead the device login completes
+// lazily through the client's forwarded ssh-agent: the agent signs the
+// device's challenge, and the device still verifies the user's real key. The
+// private key never leaves the client. No device dial happens here — the
+// agent channel only exists once the client's session is set up — so the
+// binding slot is reserved now and ensureUpstream finishes the login.
+func (s *Server) authClientPubkey(md ssh.ConnMetadata, cls Classification, key ssh.PublicKey) (*ssh.Permissions, error) {
+	binding, ok := s.deps.Registry.Lookup(cls.Alias)
+	if !ok {
+		return nil, fmt.Errorf("no live tunnel for %q", cls.Alias)
+	}
+	if !binding.AcquireBridge() {
+		return nil, fmt.Errorf("tunnel %q is at its session capacity", cls.Alias)
+	}
+	s.log.Info("client public key accepted (device login deferred to agent)",
+		"ip", sourceIPString(md.RemoteAddr()), "alias", cls.Alias,
+		"fingerprint", ssh.FingerprintSHA256(key), "type", key.Type())
+	id := base64.RawStdEncoding.EncodeToString(md.SessionID())
+	s.authStash.Store(id, &stashedAuth{
+		binding:    binding,
+		deviceUser: cls.DeviceUser,
+		pubkey:     key,
+		at:         time.Now(),
+	})
+	return &ssh.Permissions{}, nil
+}
+
+// popAuth takes the stashed device login for this connection.
+func (s *Server) popAuth(sc *ssh.ServerConn) (*stashedAuth, bool) {
 	id := base64.RawStdEncoding.EncodeToString(sc.SessionID())
 	v, ok := s.authStash.LoadAndDelete(id)
 	if !ok {
-		return stashedAuth{}, false
+		return nil, false
 	}
-	return v.(stashedAuth), true
+	return v.(*stashedAuth), true
 }
 
 // dialDevice runs the Phase-2 handshake: a forwarded-tcpip channel through
@@ -323,6 +357,16 @@ func (s *Server) popAuth(sc *ssh.ServerConn) (stashedAuth, bool) {
 // device's sshd. It returns the client plus its inbound channel/request
 // streams (the caller must drain them or the mux stalls).
 func (s *Server) dialDevice(md ssh.ConnMetadata, binding *registry.Binding, deviceUser, password string) (*ssh.Client, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+	var auth []ssh.AuthMethod
+	if password != "" {
+		auth = append(auth, ssh.Password(password))
+	}
+	return s.dialDeviceAuth(md, binding, deviceUser, auth)
+}
+
+// dialDeviceAuth is dialDevice with explicit auth methods (agent-backed
+// publickey signers for the deferred pubkey path).
+func (s *Server) dialDeviceAuth(md ssh.ConnMetadata, binding *registry.Binding, deviceUser string, auth []ssh.AuthMethod) (*ssh.Client, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	origin := "relay"
 	if md != nil {
 		origin = sourceIPString(md.RemoteAddr())
@@ -333,10 +377,6 @@ func (s *Server) dialDevice(md ssh.ConnMetadata, binding *registry.Binding, devi
 	}
 	nc.SetDeadline(time.Now().Add(deviceDialWrap))
 
-	var auth []ssh.AuthMethod
-	if password != "" {
-		auth = append(auth, ssh.Password(password))
-	}
 	cfg := &ssh.ClientConfig{
 		User: deviceUser,
 		Auth: auth,
@@ -368,10 +408,12 @@ func (s *Server) stashJanitor(ctx context.Context) {
 		case <-t.C:
 			cutoff := time.Now().Add(-5 * time.Minute)
 			s.authStash.Range(func(key, v any) bool {
-				e := v.(stashedAuth)
+				e := v.(*stashedAuth)
 				if e.at.Before(cutoff) {
 					s.authStash.Delete(key)
-					e.dev.Close()
+					if e.dev != nil {
+						e.dev.Close()
+					}
 					e.binding.ReleaseBridge()
 				}
 				return true

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync/atomic"
 
@@ -24,7 +25,9 @@ func (p *pairedChannel) Close() error {
 
 // handleClient serves one end-user connection: the stashed device login from
 // pass-through auth becomes the upstream for the session bridge and any
-// direct-tcpip forwarding channels (ARCHITECTURE §5).
+// direct-tcpip forwarding channels (ARCHITECTURE §5). For public-key
+// authenticated connections the device login is still pending and completes
+// on first use through the client's forwarded agent (ensureUpstream).
 func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-chan ssh.NewChannel, reqs <-chan *ssh.Request, state *st) {
 	ca, ok := s.popAuth(sc)
 	if !ok {
@@ -33,7 +36,9 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 		return
 	}
 	defer func() {
-		ca.dev.Close()
+		if ca.dev != nil {
+			ca.dev.Close()
+		}
 		ca.binding.ReleaseBridge()
 	}()
 
@@ -42,8 +47,21 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 	bwUp := throttle.New(state.eff.BWLimitPerSec)
 	bwDown := throttle.New(state.eff.BWLimitPerSec)
 
+	// The device-side channel/request streams only exist once the device
+	// login completed; start the drain exactly once, after ensureUpstream.
+	lazy := ca.pubkey != nil
+	draining := false
+	startDrain := func() {
+		if !draining {
+			draining = true
+			go s.drainDeviceChannels(ctx, sc, ca, state, bwUp, bwDown)
+		}
+	}
+	if !lazy {
+		startDrain()
+	}
+
 	go s.handleClientRequests(reqs)
-	go s.drainDeviceChannels(ctx, sc, ca, state, bwUp, bwDown)
 
 	var openChannels atomic.Int32
 	sessionOpen := false
@@ -54,6 +72,16 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				nch.Reject(ssh.Prohibited, "only one session per connection")
 				continue
 			}
+			// The device login must exist before the session opens — a
+			// rejected open delivers the reason reliably (like direct-tcpip);
+			// accepting first and failing later would race the client's
+			// exec/shell request against the teardown.
+			if err := s.ensureUpstream(sc, ca, state); err != nil {
+				sessionOpen = true
+				nch.Reject(ssh.Prohibited, err.Error())
+				continue
+			}
+			startDrain()
 			ch, chReqs, err := nch.Accept()
 			if err != nil {
 				continue
@@ -70,6 +98,11 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				nch.Reject(ssh.Prohibited, TCPForwardWarning)
 				continue
 			}
+			if err := s.ensureUpstream(sc, ca, state); err != nil {
+				nch.Reject(ssh.Prohibited, err.Error())
+				continue
+			}
+			startDrain()
 			if openChannels.Add(1) > maxChannelsPerClientConn {
 				openChannels.Add(-1)
 				nch.Reject(ssh.Prohibited, "too many forwarding channels on this connection")
@@ -88,7 +121,8 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 			}()
 
 		case "auth-agent@openssh.com":
-			// Held for the M6 pubkey pass-through path; unused in v1.
+			// Some clients open the agent channel themselves; drain it. The
+			// pubkey path opens its own channel in ensureUpstream.
 			ch, _, err := nch.Accept()
 			if err == nil {
 				go drainUntilClose(ch)
@@ -98,6 +132,37 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 			nch.Reject(ssh.UnknownChannelType, "unsupported channel type")
 		}
 	}
+}
+
+// ensureUpstream completes the device login for public-key authenticated
+// connections: the client's forwarded agent signs the device's challenge, so
+// the device still authenticates the user's real key. Password/none
+// connections already have their upstream and return immediately. Safe for
+// concurrent session/direct-tcpip use.
+func (s *Server) ensureUpstream(sc *ssh.ServerConn, ca *stashedAuth, state *st) error {
+	ca.mu.Lock()
+	defer ca.mu.Unlock()
+	if ca.pubkey == nil {
+		return nil // established at auth time, or by a racing channel open
+	}
+	dev, devChans, devReqs, err := s.completeAgentLogin(sc, ca)
+	if err != nil {
+		var agentErr *agentLoginError
+		if errors.As(err, &agentErr) {
+			return err // user setup issue: never counts toward fail2ban
+		}
+		if banned := s.deps.Ban.Failure(state.ip); banned {
+			s.log.Warn("ip banned after repeated device auth failures", "ip", state.ip, "alias", ca.binding.Alias)
+		} else {
+			s.log.Info("device rejected client key", "ip", state.ip, "alias", ca.binding.Alias, "user", ca.deviceUser)
+		}
+		return fmt.Errorf("device rejected your key(s) — authorize the key on the device (authorized_keys) or use password auth: %w", err)
+	}
+	s.deps.Ban.Success(state.ip)
+	ca.dev, ca.devChans, ca.devReqs = dev, devChans, devReqs
+	ca.pubkey = nil
+	s.log.Info("device login via forwarded agent", "ip", state.ip, "alias", ca.binding.Alias, "user", ca.deviceUser)
+	return nil
 }
 
 // handleClientRequests refuses forwarding toward the relay and answers
@@ -123,7 +188,7 @@ func (s *Server) handleClientRequests(reqs <-chan *ssh.Request) {
 // openDeviceDirectTCP mirrors a client direct-tcpip open onto the device.
 // The open payload is passed verbatim (target host/port + originator), and
 // device-side failures are relayed to the client verbatim (reason + message).
-func (s *Server) openDeviceDirectTCP(nch ssh.NewChannel, ca stashedAuth) (ssh.Channel, ssh.Channel, error) {
+func (s *Server) openDeviceDirectTCP(nch ssh.NewChannel, ca *stashedAuth) (ssh.Channel, ssh.Channel, error) {
 	devCh, devReqs, err := ca.dev.OpenChannel("direct-tcpip", nch.ExtraData())
 	if err != nil {
 		reason, msg := ssh.ConnectionFailed, err.Error()
@@ -146,7 +211,7 @@ func (s *Server) openDeviceDirectTCP(nch ssh.NewChannel, ca stashedAuth) (ssh.Ch
 // drainDeviceChannels consumes the device connection's inbound streams so the
 // mux never stalls. Today only x11 channel opens are meaningful (paired back
 // to the client); everything else is politely rejected.
-func (s *Server) drainDeviceChannels(ctx context.Context, sc *ssh.ServerConn, ca stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
+func (s *Server) drainDeviceChannels(ctx context.Context, sc *ssh.ServerConn, ca *stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
 	for nch := range ca.devChans {
 		switch nch.ChannelType() {
 		case "x11":

@@ -9,6 +9,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/quangdz/ssh-relay/internal/devconn"
 	"github.com/quangdz/ssh-relay/internal/guard"
@@ -32,9 +35,11 @@ import (
 // ---------- fake device sshd ----------
 
 type fakeDevice struct {
-	mu        sync.Mutex
-	passwords []string
-	sessions  []string
+	mu         sync.Mutex
+	passwords  []string
+	sessions   []string
+	pubkey     ssh.PublicKey // when set, this client key authenticates
+	pubkeyOnly bool          // when true, password auth is refused outright
 }
 
 func (f *fakeDevice) serverConfig(t *testing.T) *ssh.ServerConfig {
@@ -45,11 +50,23 @@ func (f *fakeDevice) serverConfig(t *testing.T) *ssh.ServerConfig {
 			f.mu.Lock()
 			f.passwords = append(f.passwords, string(password))
 			f.mu.Unlock()
+			if f.pubkeyOnly {
+				return nil, fmt.Errorf("password auth disabled on this device")
+			}
 			if string(password) == "devpass" {
 				return &ssh.Permissions{}, nil
 			}
 			return nil, fmt.Errorf("wrong password")
 		},
+	}
+	if f.pubkey != nil {
+		authorized := f.pubkey
+		cfg.PublicKeyCallback = func(md ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), authorized.Marshal()) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, fmt.Errorf("key not authorized")
+		}
 	}
 	cfg.AddHostKey(testHostKey(t))
 	return cfg
@@ -239,6 +256,16 @@ func (h *harness) clientDial(user, password string) (*ssh.Client, error) {
 	return ssh.Dial("tcp", h.addr(), &ssh.ClientConfig{
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+}
+
+// clientDialAuth dials with explicit auth methods (pubkey for the M6 tests).
+func (h *harness) clientDialAuth(user string, auth []ssh.AuthMethod) (*ssh.Client, error) {
+	return ssh.Dial("tcp", h.addr(), &ssh.ClientConfig{
+		User:            user,
+		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
 	})
@@ -455,6 +482,171 @@ func TestPasswordBridgeExec(t *testing.T) {
 	}
 }
 
+// TestPubkeyAgentBridgeExec: end-to-end M6 pubkey pass-through — the client
+// authenticates to the relay with a key (x/crypto verifies the signature),
+// forwards an agent, and the agent signs the device's challenge so the
+// device sees and verifies the user's real key.
+func TestPubkeyAgentBridgeExec(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, clientPriv := newEdSigner(t)
+	dev := &fakeDevice{pubkey: clientSigner.PublicKey(), pubkeyOnly: true}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+	serveAgent(t, client, clientPriv)
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+	out, err := sess.Output("echo hi")
+	if err != nil {
+		t.Fatalf("exec through agent bridge: %v", err)
+	}
+	if !strings.Contains(string(out), "welcome-device") {
+		t.Fatalf("unexpected exec output %q", string(out))
+	}
+	if len(dev.passwords) != 0 {
+		t.Fatalf("pubkey path must not touch password auth, saw %v", dev.passwords)
+	}
+}
+
+// TestPubkeyWithoutAgent: no forwarded agent → the deferred device login
+// cannot complete; the user gets exit 255 and actionable stderr.
+func TestPubkeyWithoutAgent(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, _ := newEdSigner(t)
+	dev := &fakeDevice{pubkey: clientSigner.PublicKey(), pubkeyOnly: true}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+
+	// No agent handler registered → the relay's agent channel open is
+	// refused → the session open is rejected with actionable text.
+	_, err = client.NewSession()
+	if err == nil {
+		t.Fatalf("session must fail without an agent")
+	}
+	var openErr *ssh.OpenChannelError
+	if !errorsAsOpenChannel(err, &openErr) {
+		t.Fatalf("expected channel-open rejection, got %v", err)
+	}
+	if !strings.Contains(openErr.Message, "agent forwarding unavailable") {
+		t.Fatalf("rejection must tell the user to use -A, got: %q", openErr.Message)
+	}
+}
+
+// TestPubkeyNotAuthorizedOnDevice: the relay accepts the key but the device
+// refuses it (and every other agent key) — clean failure, fail2ban counted.
+func TestPubkeyNotAuthorizedOnDevice(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, clientPriv := newEdSigner(t)
+	deviceSigner, _ := newEdSigner(t) // the key the device actually accepts
+	dev := &fakeDevice{pubkey: deviceSigner.PublicKey(), pubkeyOnly: true}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+	serveAgent(t, client, clientPriv)
+
+	// The agent offers only the client key, which the device refuses — the
+	// session open is rejected with the device-rejection explanation.
+	_, err = client.NewSession()
+	if err == nil {
+		t.Fatalf("session must fail when the device rejects the key")
+	}
+	var openErr *ssh.OpenChannelError
+	if !errorsAsOpenChannel(err, &openErr) {
+		t.Fatalf("expected channel-open rejection, got %v", err)
+	}
+	if !strings.Contains(openErr.Message, "device rejected your key") {
+		t.Fatalf("rejection must explain the device rejection, got: %q", openErr.Message)
+	}
+}
+
+// TestPubkeyAgentDirectTCP: client -L/-D through a pubkey connection — the
+// lazy device login also serves forwarding channels.
+func TestPubkeyAgentDirectTCP(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, clientPriv := newEdSigner(t)
+	dev := &fakeDevice{pubkey: clientSigner.PublicKey(), pubkeyOnly: true}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+	serveAgent(t, client, clientPriv)
+
+	type dtcp struct {
+		A string
+		B uint32
+		C string
+		D uint32
+	}
+	ch, _, err := client.OpenChannel("direct-tcpip", ssh.Marshal(dtcp{"target.internal", 80, "10.0.0.1", 5555}))
+	if err != nil {
+		t.Fatalf("direct-tcpip open through agent bridge: %v", err)
+	}
+	ch.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(ch, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("echo mismatch: %q err=%v", buf, err)
+	}
+	ch.Close()
+}
+
+// newEdSigner mints a fresh ed25519 keypair and its ssh.Signer.
+func newEdSigner(t *testing.T) (ssh.Signer, ed25519.PrivateKey) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519 keygen: %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	return signer, priv
+}
+
+// serveAgent registers a handler for the relay's auth-agent channel opens and
+// serves the given key from them — the test stand-in for the user's
+// ssh-agent behind `ssh -A`.
+func serveAgent(t *testing.T, client *ssh.Client, priv ed25519.PrivateKey) {
+	t.Helper()
+	opens := client.HandleChannelOpen("auth-agent@openssh.com")
+	if opens == nil {
+		t.Fatalf("agent handler already registered")
+	}
+	keyring := agent.NewKeyring()
+	if err := keyring.Add(agent.AddedKey{PrivateKey: priv}); err != nil {
+		t.Fatalf("agent keyring add: %v", err)
+	}
+	go func() {
+		for nch := range opens {
+			ch, _, err := nch.Accept()
+			if err != nil {
+				continue
+			}
+			go agent.ServeAgent(keyring, ch)
+		}
+	}()
+}
+
 func TestDirectTCPIPAllowedAndGated(t *testing.T) {
 	h := newHarness(t, nil)
 	dev := &fakeDevice{}
@@ -521,6 +713,14 @@ func errorsAsOpenChannel(err error, target **ssh.OpenChannelError) bool {
 	oe, ok := err.(*ssh.OpenChannelError)
 	if ok {
 		*target = oe
+	}
+	return ok
+}
+
+func errorsAsExit(err error, target **ssh.ExitError) bool {
+	ee, ok := err.(*ssh.ExitError)
+	if ok {
+		*target = ee
 	}
 	return ok
 }
@@ -645,6 +845,14 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if doc.Bindings[0].SSHCommand != "ssh "+alias+"@relay.test" {
 		t.Fatalf("ssh_command wrong: %q", doc.Bindings[0].SSHCommand)
+	}
+	// The custom-user template must keep `<user>` literal — no HTML escaping
+	// (\u003c) in the wire bytes.
+	if !bytes.Contains(out, []byte("<user>+"+alias+"@relay.test")) {
+		t.Fatalf("custom_user_template not literal: %s", out)
+	}
+	if bytes.Contains(out, []byte(`\u003c`)) || bytes.Contains(out, []byte(`\u003e`)) {
+		t.Fatalf("HTML-escaped JSON: %s", out)
 	}
 	if doc.Sessions.Used < 1 || doc.Sessions.Used > 2 {
 		t.Fatalf("used quota off (device + status minus self): %d", doc.Sessions.Used)

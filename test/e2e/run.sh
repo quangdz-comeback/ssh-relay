@@ -165,7 +165,41 @@ done
 echo "$OUT" | grep -q "custom-alias-ok" || { echo "$OUT"; fail "custom alias bridge failed"; }
 note "custom alias OK"
 
+# ---------- pubkey pass-through via agent forwarding (M6) ----------
+# The device accepts a key the user keeps in an agent; the relay forwards the
+# agent so the device verifies the real key (ARCHITECTURE §5).
+ssh-keygen -q -t ed25519 -N '' -f "$WORK/e2e_key" >/dev/null 2>&1
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+cp /root/.ssh/authorized_keys /root/.ssh/authorized_keys.pre-e2e 2>/dev/null || true
+cat "$WORK/e2e_key.pub" >> /root/.ssh/authorized_keys
+eval "$(ssh-agent -a "$WORK/agent.sock")" >/dev/null
+PIDS="$PIDS $SSH_AGENT_PID"
+ssh-add "$WORK/e2e_key" >/dev/null
+OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" ssh "${SSH_OPTS[@]}" -A \
+  -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
+  "root+$ALIAS@127.0.0.1" 'echo pubkey-agent-e2e-ok' 2>&1)
+echo "$OUT" | grep -q "pubkey-agent-e2e-ok" || { echo "$OUT"; fail "pubkey + agent bridge failed"; }
+note "pubkey via agent forwarding OK"
+
+# Same key WITHOUT the agent: the relay accepts the key but the device login
+# needs the agent → the session open is rejected with the -A hint (openssh
+# only surfaces channel-open refusals at DEBUG).
+OUT=$(env "${CLIENT_ENV[@]}" setsid ssh -p "$PORT_RELAY" \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+  -o LogLevel=DEBUG -o BatchMode=yes \
+  -o PubkeyAuthentication=yes -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
+  "root+$ALIAS@127.0.0.1" 'echo should-not-happen' 2>&1)
+echo "$OUT" | grep -q "agent forwarding unavailable" || { echo "$OUT"; fail "missing -A hint for agentless pubkey"; }
+echo "$OUT" | grep -q "should-not-happen" && fail "agentless pubkey must not open a session"
+note "agentless pubkey rejected with -A hint OK"
+
 kill "$REG_PID" "$REG2_PID" 2>/dev/null
+# restore authorized_keys to its pre-test state (remove only our key line)
+if [ -f /root/.ssh/authorized_keys.pre-e2e ]; then
+  mv /root/.ssh/authorized_keys.pre-e2e /root/.ssh/authorized_keys
+elif [ -f /root/.ssh/authorized_keys ]; then
+  rm /root/.ssh/authorized_keys
+fi
 E2E_PASS=1
 echo ""
 echo "E2E PASS: all real-OpenSSH scenarios green."

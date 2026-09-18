@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
 
@@ -48,7 +50,7 @@ func (s *Server) handleDevice(ctx context.Context, sc *ssh.ServerConn, chans <-c
 			s.log.Warn("control session accept failed", "ip", state.ip, "err", err)
 			continue
 		}
-		s.runControlShell(ctx, ch, chReqs, state, jsonMode)
+		s.runControlShell(ctx, sc, ch, chReqs, state, jsonMode)
 	}
 
 	if freed := s.deps.Registry.ReleaseByOwner(sc); len(freed) > 0 {
@@ -128,24 +130,58 @@ func (s *Server) handleDeviceRequests(ctx context.Context, sc *ssh.ServerConn, r
 // it. In JSON mode it prints the machine-readable status document instead of
 // the human banner. Output is written when the shell/exec request arrives —
 // after -R processing, so the document always contains the new bindings.
-func (s *Server) runControlShell(ctx context.Context, ch ssh.Channel, reqs <-chan *ssh.Request, state *st, jsonMode bool) {
+//
+// When the client allocated a PTY the output is CRLF-terminated (openssh
+// puts the local terminal in raw mode: bare \n would staircase), and
+// Ctrl+C/Ctrl+D tear the control connection — and the tunnel — down.
+func (s *Server) runControlShell(ctx context.Context, sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request, state *st, jsonMode bool) {
 	var once sync.Once
+	var pty atomic.Bool
 	writeOutput := func() {
 		if jsonMode {
 			doc, err := s.buildStatusDoc(state.ip, true, state.eff)
-			if err == nil {
-				ch.Write(append(doc, '\n'))
-			} else {
+			if err != nil {
 				fmt.Fprintf(ch, "error building status document: %v\r\n", err)
+				return
 			}
+			ch.Write(toTerminal(doc, pty.Load()))
 			return
 		}
-		fmt.Fprint(ch, s.controlBanner(state.ip))
+		ch.Write(toTerminal([]byte(s.controlBanner(state.ip)), pty.Load()))
 	}
+
+	// Keyboard monitor: with a PTY the client terminal is in raw mode, so
+	// ^C/^D arrive as 0x03/0x04 data bytes on this channel. Either one closes
+	// the control connection — and with it the tunnel. The monitor starts
+	// before the request loop so keystrokes are seen while it is running.
+	hungUp := make(chan struct{})
+	go func() {
+		defer close(hungUp)
+		buf := make([]byte, 512)
+		for {
+			n, err := ch.Read(buf)
+			if pty.Load() {
+				for i := 0; i < n; i++ {
+					if buf[i] == 0x03 || buf[i] == 0x04 {
+						s.log.Info("control shell exit requested", "ip", state.ip, "key", map[byte]string{0x03: "Ctrl+C", 0x04: "Ctrl+D"}[buf[i]])
+						ch.Close()
+						sc.Close()
+						return
+					}
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
 
 	for req := range reqs {
 		switch req.Type {
-		case "pty-req", "env":
+		case "pty-req":
+			pty.Store(true)
+			req.Reply(true, nil)
+		case "env":
 			req.Reply(true, nil)
 		case "shell", "exec":
 			req.Reply(true, nil)
@@ -157,22 +193,44 @@ func (s *Server) runControlShell(ctx context.Context, ch ssh.Channel, reqs <-cha
 		}
 	}
 
-	// Hold the session (and therefore the tunnel) until it dies.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, 512)
-		for {
-			if _, err := ch.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
+	// The request stream ended (connection died or client hung up). Close our
+	// side so the monitor sees EOF, then wait for it to finish.
+	ch.Close()
 	select {
-	case <-done:
+	case <-hungUp:
 	case <-ctx.Done():
-		ch.Close()
 	}
+}
+
+// toTerminal converts LF to CRLF when the client side is a raw-mode terminal.
+// Piped clients (automation) keep plain LF so `| jq` stays clean.
+func toTerminal(b []byte, pty bool) []byte {
+	if !pty {
+		return b
+	}
+	return bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n"))
+}
+
+// sshCommand renders the end-user connect command for an alias, including
+// the port when the relay is not listening on 22 (PLAN §3).
+func (s *Server) sshCommand(alias string) string {
+	return fmt.Sprintf("ssh %s%s@%s", s.portFlag(), alias, s.deps.AdvertiseHost)
+}
+
+// sshUserCommand renders the custom-device-user variant of the command.
+func (s *Server) sshUserCommand(alias string) string {
+	return fmt.Sprintf("ssh %s<user>+%s@%s", s.portFlag(), alias, s.deps.AdvertiseHost)
+}
+
+func (s *Server) portFlag() string {
+	port := 22
+	if s.deps.Cfg != nil {
+		port = s.deps.Cfg.ListenPort
+	}
+	if port == 22 || port == 0 {
+		return ""
+	}
+	return fmt.Sprintf("-p %d ", port)
 }
 
 func (s *Server) controlBanner(ip string) string {
@@ -184,10 +242,10 @@ func (s *Server) controlBanner(ip string) string {
 	}
 	for _, b := range bindings {
 		out += "Tunnel online: " + b.Alias + "\n\n"
-		out += "Connect:            ssh " + b.Alias + "@" + s.deps.AdvertiseHost + "\n"
-		out += "Custom device user: ssh <user>+" + b.Alias + "@" + s.deps.AdvertiseHost + "\n\n"
+		out += "Connect:            " + s.sshCommand(b.Alias) + "\n"
+		out += "Custom device user: " + s.sshUserCommand(b.Alias) + "\n\n"
 	}
-	out += "Keep this session open to keep the tunnel alive.\n"
+	out += "Keep this session open to keep the tunnel alive. (Ctrl+C exits)\n"
 	out += "───────────────────────────────────────────────────────\n"
 	return out
 }

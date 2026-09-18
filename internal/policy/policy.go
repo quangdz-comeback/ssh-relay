@@ -36,6 +36,7 @@ type customPolicyJSON struct {
 // load error (fail-closed on mass deploys).
 type PolicySet struct {
 	ListenIP string             `json:"listen_ip,omitempty"`
+	Hostname string             `json:"hostname,omitempty"`
 	Default  Fields             `json:"default"`
 	Custom   []customPolicyJSON `json:"custom_policies,omitempty"`
 

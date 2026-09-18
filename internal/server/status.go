@@ -56,8 +56,8 @@ func (s *Server) buildStatusDoc(ip string, excludeSelf bool, eff policy.Effectiv
 			Alias:              b.Alias,
 			ListenAddress:      listenAddressLabel(b.ListenAddr),
 			CreatedAt:          b.Created().UTC().Format(time.RFC3339),
-			SSHCommand:         fmt.Sprintf("ssh %s@%s", b.Alias, s.deps.AdvertiseHost),
-			CustomUserTemplate: fmt.Sprintf("ssh <user>+%s@%s", b.Alias, s.deps.AdvertiseHost),
+			SSHCommand:         s.sshCommand(b.Alias),
+			CustomUserTemplate: s.sshUserCommand(b.Alias),
 			BridgesUsed:        b.Bridges(),
 			BridgesMax:         b.MaxBridges,
 		})
@@ -89,21 +89,27 @@ func (s *Server) handleStatus(ctx context.Context, sc *ssh.ServerConn, chans <-c
 			continue
 		}
 		// Answer session setup inline; write the document once the client
-		// asks for its shell/exec so the reply precedes the output.
+		// asks for its shell/exec so the reply precedes the output. With a
+		// PTY the document is CRLF-terminated for terminal display; piped
+		// clients get plain LF (jq-safe).
+		pty := false
 		for req := range chReqs {
 			switch req.Type {
+			case "pty-req":
+				pty = true
+				req.Reply(true, nil)
 			case "shell", "exec":
 				req.Reply(true, nil)
 				doc, derr := s.buildStatusDoc(state.ip, true, state.eff)
 				if derr != nil {
 					fmt.Fprintf(ch, "error building status document: %v\r\n", derr)
 				} else {
-					ch.Write(append(doc, '\n'))
+					ch.Write(toTerminal(append(doc, '\n'), pty))
 				}
 				ch.SendRequest("exit-status", false, ssh.Marshal(exitStatusMsg{Status: 0}))
 				ch.Close()
 				return
-			case "pty-req", "env":
+			case "env":
 				req.Reply(true, nil)
 			default:
 				if req.WantReply {

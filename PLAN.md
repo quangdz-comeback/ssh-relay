@@ -105,7 +105,10 @@ Ops flags (secondary, documented but not part of the core contract)
   --data-dir string                 host key storage (default /var/lib/relay or ~/.local/share/relay)
   --policy-file string              policy.json path (default "policy.json" in the working
                                     directory; auto-loaded when present, hot-reloaded on change)
-  --advertise-host string           hostname printed in the control shell (default: os hostname)
+  --hostname string                display host in printed SSH commands (default:
+                                   auto-detect public IP via ifconfig.me; policy.json
+                                   "hostname" entry also works; falls back to os hostname
+                                   if the lookup fails)
   --log-level string                debug|info|warn|error (default info)
   --version                         print version and exit
 ```
@@ -153,8 +156,17 @@ $ ssh -R 0:127.0.0.1:22 ssh@relay.example.com
   ───────────────────────────────────────────────────────
 ```
 
-The control shell blocks (like `sleep infinity`); `Ctrl+C` or network loss tears
-the binding down immediately.
+The control shell blocks (like `sleep infinity`); `Ctrl+C` (or `Ctrl+D`) or
+network loss tears the binding down immediately. When the client allocated a
+PTY the output uses CRLF line endings (openssh puts the terminal in raw mode;
+bare `\n` would staircase), and `ssh+json` clients that pipe into `jq` get
+clean LF.
+
+The printed connect commands reflect the listener: when `--listen-port` is not
+22 they carry `-p <port>` (e.g. `ssh -p 2222 d-…@host`), and the host part is
+resolved as `--hostname` flag → policy.json `"hostname"` → public IP (queried
+once at startup from ifconfig.me, with api.ipify.org as fallback) → os
+hostname if the lookup fails.
 
 > Note: the device-side target (`127.0.0.1:22` in the `-R` command) never
 > crosses the wire — the device's own ssh client dials it when the relay opens
@@ -391,6 +403,10 @@ job on tag.
    with zero tunnels still gets its quota. `sessions.used` excludes the
    querying connection itself. `ssh+json` is a full device login (forwards
    work, tunnel held open); `json` is status-only and closes immediately.
+10. **Display host auto-detection makes one outbound HTTPS request at startup**
+   (ifconfig.me, api.ipify.org as fallback) when neither `--hostname` nor the
+   policy.json `"hostname"` entry is set — air-gapped deployments should set one
+   of them explicitly; otherwise the relay falls back to the os hostname.
 
 ---
 

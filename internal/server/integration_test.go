@@ -7,6 +7,7 @@ package server
 // JSON, per-IP limits and fail2ban.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -522,6 +523,84 @@ func errorsAsOpenChannel(err error, target **ssh.OpenChannelError) bool {
 		*target = oe
 	}
 	return ok
+}
+
+// TestControlShellCtrlC: with a PTY the banner arrives CRLF-terminated and
+// Ctrl+C (0x03) tears the control connection — and the binding — down.
+func TestControlShellCtrlC(t *testing.T) {
+	h := newHarness(t, nil)
+	dev := &fakeDevice{}
+	conn := h.deviceControlConn(t, dev, "ssh")
+
+	ok, payload, err := conn.SendRequest("tcpip-forward", true, ssh.Marshal(tcpipForwardClientMsg{Addr: "", Port: 0}))
+	if err != nil || !ok {
+		t.Fatalf("tcpip-forward: ok=%v err=%v", ok, err)
+	}
+	var bp boundPortClientMsg
+	ssh.Unmarshal(payload, &bp)
+	alias := "" // read from the banner below
+
+	ch, chReqs, err := conn.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	go func() {
+		for req := range chReqs {
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+		}
+	}()
+	// pty-req marks the session as interactive (raw terminal on the client).
+	if _, err := ch.SendRequest("pty-req", true, ssh.Marshal(struct {
+		Term                         string
+		Columns, Rows, Width, Height uint32
+		Modes                        []byte `ssh:"rest"`
+	}{"xterm", 80, 24, 640, 480, nil})); err != nil {
+		t.Fatalf("pty-req: %v", err)
+	}
+	if _, err := ch.SendRequest("shell", true, nil); err != nil {
+		t.Fatalf("shell: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	var banner []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		n, err := ch.Read(buf)
+		if n > 0 {
+			banner = append(banner, buf[:n]...)
+			if bytes.Contains(banner, []byte("Tunnel online: ")) {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("banner read: %v", err)
+		}
+	}
+	// PTY session → CRLF line endings (no staircase).
+	if !bytes.Contains(banner, []byte("\r\n")) {
+		t.Fatalf("pty banner must use CRLF: %q", banner)
+	}
+	if m := regexp.MustCompile(`Tunnel online: (\S+)`).FindSubmatch(banner); m != nil {
+		alias = string(m[1])
+	}
+	if !strings.HasPrefix(alias, "d-") {
+		t.Fatalf("alias = %q", alias)
+	}
+
+	// Ctrl+C → control conn closed → binding released.
+	if _, err := ch.Write([]byte{0x03}); err != nil {
+		t.Fatalf("write ctrl-c: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, live := h.registry.Lookup(alias); !live {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("Ctrl+C did not tear the tunnel down")
 }
 
 func TestStatusEndpoint(t *testing.T) {

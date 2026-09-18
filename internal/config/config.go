@@ -24,6 +24,7 @@ const (
 type Config struct {
 	ListenIP             string
 	ListenPort           int
+	Hostname             string // display host for printed SSH commands ("" = auto)
 	BWLimit              string // raw grammar, parsed by bwlimit
 	AllowedSessionsPerIP int
 	Fail2ban             bool
@@ -99,7 +100,8 @@ func Parse(args []string) (*Config, error) {
 	fs.BoolVar(&c.AllowSCP, "allow-scp", true, "allow legacy scp exec requests")
 	fs.BoolVar(&c.AllowX11Forwarding, "allow-x11-forwarding", false, "allow X11 forwarding")
 	fs.StringVar(&c.DataDir, "data-dir", defaultDataDir(), "state directory (host key)")
-	fs.StringVar(&c.AdvertiseHost, "advertise-host", "", "hostname printed in control output (default: os hostname)")
+	fs.StringVar(&c.Hostname, "hostname", "",
+		"display host in printed SSH commands (default: auto-detect public IP; policy.json \"hostname\" also works)")
 	fs.StringVar(&c.LogLevel, "log-level", "info", "debug|info|warn|error")
 	fs.StringVar(&c.PolicyFile, "policy-file", "policy.json", "policy.json path (auto-loaded when present, hot-reloaded)")
 	fs.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
@@ -109,13 +111,6 @@ func Parse(args []string) (*Config, error) {
 	}
 	fs.Visit(func(f *flag.Flag) { c.flagSet[f.Name] = true })
 
-	if c.AdvertiseHost == "" {
-		h, err := os.Hostname()
-		if err != nil || h == "" {
-			h = "relay"
-		}
-		c.AdvertiseHost = h
-	}
 	if _, err := c.Validate(); err != nil {
 		return nil, err
 	}

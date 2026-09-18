@@ -40,6 +40,12 @@ Optional `policy.json` (auto-loaded from the working directory or
 gates, or `blocked: true` for abusive ranges. Explicitly passed flags win over
 the file's `default` block. See ARCHITECTURE §6.3 for the full schema.
 
+Printed SSH commands use the display host resolved as `--hostname` flag →
+policy.json `"hostname"` → auto-detected public IP (one HTTPS query to
+ifconfig.me at startup; set `--hostname` on air-gapped hosts) → os hostname,
+and carry `-p <port>` whenever `--listen-port` is not 22. The control shell
+exits on `Ctrl+C`/`Ctrl+D`, which tears the tunnel down.
+
 ## Status
 
 - M0–M5 implemented and covered by unit, protocol, in-process integration

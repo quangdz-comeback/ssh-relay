@@ -54,7 +54,7 @@ note "device sshd up on :$PORT_SSHD"
 
 # ---------- relay ----------
 "$ROOT/relay" --listen-port "$PORT_RELAY" --ip 127.0.0.1 \
-  --data-dir "$WORK/relay-data" --advertise-host 127.0.0.1 \
+  --data-dir "$WORK/relay-data" --hostname 127.0.0.1 \
   --policy-file "$WORK/no-policy.json" --log-level info \
   > "$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
@@ -75,7 +75,7 @@ done
 ALIAS=$(grep -o 'Tunnel online: [^ ]*' "$WORK/banner.txt" | head -1 | awk '{print $3}')
 [ -n "$ALIAS" ] || { cat "$WORK/banner.txt"; fail "no deviceID in banner"; }
 note "registered auto alias: $ALIAS"
-grep -q "ssh $ALIAS@127.0.0.1" "$WORK/banner.txt" || fail "banner missing connect command"
+grep -q "ssh -p $PORT_RELAY $ALIAS@127.0.0.1" "$WORK/banner.txt" || fail "banner missing connect command"
 
 # askpass helper for password prompts
 cat > "$WORK/askpass" <<EOF
@@ -121,7 +121,7 @@ wait "$LFWD_PID" 2>/dev/null
 # warning text.
 PORT_RELAY2=$((PORT_RELAY + 1))
 "$ROOT/relay" --listen-port "$PORT_RELAY2" --ip 127.0.0.1 \
-  --data-dir "$WORK/relay-data2" --advertise-host 127.0.0.1 \
+  --data-dir "$WORK/relay-data2" --hostname 127.0.0.1 \
   --allow-tcp-forwarding=false \
   --policy-file "$WORK/no-policy.json" --log-level info \
   > "$WORK/relay2.log" 2>&1 &

@@ -163,10 +163,16 @@ Notes:
 ### 4.2 Control shell
 
 A fake session channel handler that writes the banner (§4 of PLAN), then blocks
-on a `chan struct{}` closed at teardown. It never reads stdin. This is what
-keeps `ssh -R …` alive without `-N`, and how the operator learns the `deviceID`
-(OpenSSH prints nothing about assigned forwards by default; with `-N` the ID is
-only in relay logs — custom aliases are the escape hatch, documented).
+on a `chan struct{}` closed at teardown. This is what keeps `ssh -R …` alive
+without `-N`, and how the operator learns the `deviceID` (OpenSSH prints
+nothing about assigned forwards by default; with `-N` the ID is only in relay
+logs — custom aliases are the escape hatch, documented).
+
+Input is watched from the moment the channel opens: with a PTY the client
+terminal is in raw mode, so `Ctrl+C` (`0x03`) or `Ctrl+D` (`0x04`) close the
+control connection — the tunnel tears down exactly like a network loss.
+Output is LF→CRLF-converted when a PTY was allocated (raw-mode terminals
+staircase on bare `\n`); piped `ssh+json` clients keep clean LF for `jq`.
 
 ### 4.3 Bridge channel opening (relay → device)
 
@@ -230,7 +236,9 @@ its quota; `bindings` is the array:
 ```
 
 - `created_at` is RFC3339 UTC; `ssh_command` / `custom_user_template` are built
-  from `--advertise-host`.
+  from the display host (`--hostname` flag → policy.json `"hostname"` →
+  auto-detected public IP at startup) and carry `-p <port>` when the listener
+  is not on 22.
 - `sessions.used` counts live authenticated connections from the requesting IP
   **excluding the querying connection itself** (it answers "how many of my
   slots are taken by real traffic"); `allowed` = the effective policy's
@@ -412,6 +420,7 @@ File format — strict schema (unknown fields are a load error); first match in
 ```json
 {
   "listen_ip": "",
+  "hostname": "",
   "default": {
     "allow_tcp_forwarding": true,
     "allow_sftp": true,
@@ -463,8 +472,9 @@ Semantics:
   the same knob in the `default` block (tracked via flag-set detection);
   unpassed flags defer to the file. `custom_policies` always apply on top for
   matched IPs. `--fail2ban` is a global switch outside this layering, and
-  `--ip`/`listen_ip` only affect the listener socket at startup (never
-  hot-reloaded).
+  `--ip`/`listen_ip` plus `hostname` only take effect at startup (never
+  hot-reloaded) — `hostname` sets the display host for printed SSH commands
+  unless `--hostname` was passed explicitly.
 
 ```go
 type Policy struct {

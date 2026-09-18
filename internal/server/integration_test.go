@@ -38,6 +38,7 @@ type fakeDevice struct {
 	mu         sync.Mutex
 	passwords  []string
 	sessions   []string
+	agentKeys  []string      // key types seen through the forwarded agent
 	pubkey     ssh.PublicKey // when set, this client key authenticates
 	pubkeyOnly bool          // when true, password auth is refused outright
 }
@@ -128,7 +129,7 @@ func (f *fakeDevice) handle(sc *ssh.ServerConn, chans <-chan ssh.NewChannel, req
 			if err != nil {
 				continue
 			}
-			go f.session(ch, chReqs)
+			go f.session(sc, ch, chReqs)
 		case "direct-tcpip":
 			ch, _, err := nch.Accept()
 			if err != nil {
@@ -141,9 +142,28 @@ func (f *fakeDevice) handle(sc *ssh.ServerConn, chans <-chan ssh.NewChannel, req
 	}
 }
 
-func (f *fakeDevice) session(ch ssh.Channel, reqs <-chan *ssh.Request) {
+func (f *fakeDevice) session(sc *ssh.ServerConn, ch ssh.Channel, reqs <-chan *ssh.Request) {
 	for req := range reqs {
 		switch req.Type {
+		case "auth-agent-req@openssh.com":
+			// Play the device sshd: accept forwarding, then reach back for
+			// the agent the way a real sshd does when the session uses it.
+			req.Reply(true, nil)
+			go func() {
+				ach, _, err := sc.OpenChannel("auth-agent@openssh.com", nil)
+				if err != nil {
+					return
+				}
+				signers, err := agent.NewClient(ach).Signers()
+				f.mu.Lock()
+				if err == nil {
+					for _, sgn := range signers {
+						f.agentKeys = append(f.agentKeys, sgn.PublicKey().Type())
+					}
+				}
+				f.mu.Unlock()
+				ach.Close()
+			}()
 		case "pty-req", "env", "shell", "exec", "subsystem":
 			if req.Type == "exec" || req.Type == "subsystem" {
 				f.mu.Lock()
@@ -645,6 +665,100 @@ func serveAgent(t *testing.T, client *ssh.Client, priv ed25519.PrivateKey) {
 			go agent.ServeAgent(keyring, ch)
 		}
 	}()
+}
+
+// TestAgentForwardingInsideSession: for a public-key login the relay mirrors
+// auth-agent-req to the device and pairs the device's agent channels back to
+// the client, so programs inside the session reach the user's real agent.
+func TestAgentForwardingInsideSession(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, clientPriv := newEdSigner(t)
+	dev := &fakeDevice{pubkey: clientSigner.PublicKey()}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+	serveAgent(t, client, clientPriv)
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+	if ok, err := sess.SendRequest("auth-agent-req@openssh.com", true, nil); err != nil || !ok {
+		t.Fatalf("auth-agent-req must be mirrored and accepted (ok=%v err=%v)", ok, err)
+	}
+	out, err := sess.Output("echo hi")
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if !strings.Contains(string(out), "welcome-device") {
+		t.Fatalf("unexpected exec output %q", string(out))
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		dev.mu.Lock()
+		n := len(dev.agentKeys)
+		dev.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("device never saw the forwarded agent keys")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	if len(dev.agentKeys) != 1 || dev.agentKeys[0] != clientSigner.PublicKey().Type() {
+		t.Fatalf("device saw wrong agent keys: %v", dev.agentKeys)
+	}
+}
+
+// TestAgentRefusedForPassword: agent forwarding auto-disables for
+// password/none logins — the request is refused with the reason and the
+// device is never asked.
+func TestAgentRefusedForPassword(t *testing.T) {
+	h := newHarness(t, nil)
+	dev := &fakeDevice{}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDial("root+"+alias, "devpass")
+	if err != nil {
+		t.Fatalf("client auth: %v", err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+	var stderr bytes.Buffer
+	sess.Stderr = &stderr
+	ok, err := sess.SendRequest("auth-agent-req@openssh.com", true, nil)
+	if err != nil {
+		t.Fatalf("auth-agent-req: %v", err)
+	}
+	if ok {
+		t.Fatalf("auth-agent-req must be refused for password logins")
+	}
+	out, err := sess.Output("echo hi")
+	if err != nil || !strings.Contains(string(out), "welcome-device") {
+		t.Fatalf("session must still work after refusal (out=%q err=%v)", out, err)
+	}
+	if !strings.Contains(stderr.String(), "requires public key auth") {
+		t.Fatalf("stderr must explain the refusal, got %q", stderr.String())
+	}
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	if len(dev.agentKeys) != 0 {
+		t.Fatalf("device must not see any agent on a password login: %v", dev.agentKeys)
+	}
 }
 
 func TestDirectTCPIPAllowedAndGated(t *testing.T) {

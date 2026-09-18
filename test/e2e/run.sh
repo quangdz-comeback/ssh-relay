@@ -2,7 +2,9 @@
 # Real-OpenSSH end-to-end smoke test:
 #   device (real sshd, password auth) --ssh -R--> relay <--ssh-- end user
 # Covers: auto-ID registration banner, password bridge exec (root + user+alias),
-# status JSON endpoint, TCP-forwarding refusal warning, custom alias.
+# status JSON endpoint, TCP-forwarding refusal warning, custom alias,
+# pubkey login via a real ssh-agent (-A), agentless refusal hint, and agent
+# forwarding inside the session (ssh hop from the device with the agent).
 set -u
 
 cd "$(dirname "$0")/../.."
@@ -192,6 +194,15 @@ OUT=$(env "${CLIENT_ENV[@]}" setsid ssh -p "$PORT_RELAY" \
 echo "$OUT" | grep -q "agent forwarding unavailable" || { echo "$OUT"; fail "missing -A hint for agentless pubkey"; }
 echo "$OUT" | grep -q "should-not-happen" && fail "agentless pubkey must not open a session"
 note "agentless pubkey rejected with -A hint OK"
+
+# Agent forwarding inside the session (pubkey login): from the device, hop to
+# a second ssh using the forwarded agent — SSH_AUTH_SOCK must be live there.
+OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" timeout 20 ssh "${SSH_OPTS[@]}" -A \
+  -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
+  "root+$ALIAS@127.0.0.1" \
+  "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p $PORT_SSHD root@127.0.0.1 echo hop-agent-e2e-ok" 2>&1)
+echo "$OUT" | grep -q "hop-agent-e2e-ok" || { echo "$OUT"; fail "agent forwarding inside session failed"; }
+note "agent forwarding inside session OK"
 
 kill "$REG_PID" "$REG2_PID" 2>/dev/null
 # restore authorized_keys to its pre-test state (remove only our key line)

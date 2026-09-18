@@ -309,6 +309,16 @@ does not make a relay-local decision; it *performs the device login*:
    the `-A` + `ssh-add` hint (user setup mistake, never a fail2ban failure);
    the device refusing every offered key → rejected with the `authorized_keys`
    hint and counted as a credential failure.
+4. **Inside the session.** On a public-key login the relay also mirrors the
+   client's `auth-agent-req@openssh.com` to the device session and pairs the
+   device's `auth-agent@openssh.com` opens back to the client, so the agent is
+   live *inside* the remote session (hop to further hosts, git over SSH, …).
+   Password/none logins refuse the request with
+   `agent forwarding requires public key auth` — auto-disabled, since the key
+   plays no role there. There is no relay-side flag: the client's `-A` is the
+   only switch, so nothing to enable or disable server-side. Standard SSH
+   caveat applies: while the session lives, root on the device can use the
+   forwarded agent — forward only to devices you trust.
 
 Implementation notes:
 
@@ -339,8 +349,8 @@ matches common `ssh` behavior, keeps pairing simple). Requests are mirrored
 | `x11-req` | gate on `--allow-x11-forwarding`, then mirror verbatim - the end user's openssh client owns the fake-cookie translation, so pairing device-side `x11` opens back to the client is plain splicing (drain loop, client.go) |
 | `signal` | mirror (INT, TERM, HUP, KILL, QUIT, USR1, USR2) |
 | `window-change` | mirror |
+| `auth-agent-req@openssh.com` (`-A`) | public-key logins: mirror verbatim so the device's sshd wires `SSH_AUTH_SOCK`, and pair the device's agent channels back to the client (§5.2.1). password/none logins: refused with `agent forwarding requires public key auth` — the client disables forwarding instead of silently missing the agent. A device that refuses the mirrored request disables it on its side. No relay flag: the client's `-A` is the only switch |
 | `break` | ignore + ok |
-| `auth-agent-req@openssh.com` | accept (the client asking for agent forwarding; the relay drives the channel itself in the pubkey path, §5.2.1) |
 | unknown requests | reply `failure`, never forward |
 
 Gate references above resolve through the connection's **effective policy**
@@ -408,7 +418,7 @@ requests.
 | global `tcpip-forward` (`-R <port>:…` from the client) | **denied** | request-failure, reason `[WARNING] TCP forwarding is not supported.` |
 | global `cancel-tcpip-forward` | — | ack, no-op |
 | channel open `x11` | `--allow-x11-forwarding` | client-initiated opens never occur; device-initiated x11 opens are paired back to the client when the gate allows (drain loop, client.go) |
-| channel open `auth-agent@openssh.com` | — | client-initiated opens are drained (some clients open it themselves); pubkey connections open it toward the client in the deferred login (§5.2.1) |
+| channel open `auth-agent@openssh.com` | — | client-initiated opens are drained (some clients open it themselves); pubkey connections open it toward the client for the deferred login (§5.2.1), and device-initiated agent opens (session forwarding) are paired back to the client on pubkey logins |
 
 ### 6.2 Device connection (control, `ssh@…`)
 

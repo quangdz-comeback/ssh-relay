@@ -145,7 +145,7 @@ func (s *Server) ensureUpstream(sc *ssh.ServerConn, ca *stashedAuth, state *st) 
 	if ca.pubkey == nil {
 		return nil // established at auth time, or by a racing channel open
 	}
-	dev, devChans, devReqs, err := s.completeAgentLogin(sc, ca)
+	dev, devAgentChans, devX11Chans, devReqs, err := s.completeAgentLogin(sc, ca)
 	if err != nil {
 		var agentErr *agentLoginError
 		if errors.As(err, &agentErr) {
@@ -159,7 +159,7 @@ func (s *Server) ensureUpstream(sc *ssh.ServerConn, ca *stashedAuth, state *st) 
 		return fmt.Errorf("device rejected your key(s) — authorize the key on the device (authorized_keys) or use password auth: %w", err)
 	}
 	s.deps.Ban.Success(state.ip)
-	ca.dev, ca.devChans, ca.devReqs = dev, devChans, devReqs
+	ca.dev, ca.devAgentChans, ca.devX11Chans, ca.devReqs = dev, devAgentChans, devX11Chans, devReqs
 	ca.pubkey = nil
 	s.log.Info("device login via forwarded agent", "ip", state.ip, "alias", ca.binding.Alias, "user", ca.deviceUser)
 	return nil
@@ -208,16 +208,47 @@ func (s *Server) openDeviceDirectTCP(nch ssh.NewChannel, ca *stashedAuth) (ssh.C
 	return ch, devCh, nil
 }
 
-// drainDeviceChannels consumes the device connection's inbound streams so the
-// mux never stalls. Today only x11 channel opens are meaningful (paired back
-// to the client); everything else is politely rejected.
+// drainDeviceChannels consumes the device connection's inbound streams so
+// the mux never stalls: session agent forwarding and x11 opens are paired
+// back to the end user's client, everything else the mux already rejected
+// (unregistered types never reach us — see dialDeviceAuth).
 func (s *Server) drainDeviceChannels(ctx context.Context, sc *ssh.ServerConn, ca *stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
-	for nch := range ca.devChans {
+	accept := func(nch ssh.NewChannel) {
 		switch nch.ChannelType() {
+		case "auth-agent@openssh.com":
+			// The device's sshd opened the user's agent channel (session
+			// agent forwarding). Only public-key logins have the mirrored
+			// auth-agent-req that leads here; refuse anything else so a
+			// stray device open never reaches a password-login client.
+			s.log.Debug("device opened agent channel", "ip", state.ip, "pubkey_auth", ca.pubkeyAuth)
+			if !ca.pubkeyAuth {
+				nch.Reject(ssh.Prohibited, "agent forwarding requires public key auth")
+				return
+			}
+			// Pair it back so programs inside the session reach the real
+			// agent.
+			clientCh, clientReqs, err := sc.OpenChannel("auth-agent@openssh.com", nch.ExtraData())
+			if err != nil {
+				s.log.Warn("agent channel open to client failed", "ip", state.ip, "err", err)
+				nch.Reject(ssh.Prohibited, "could not open agent channel to client")
+				return
+			}
+			go drainChannelRequests(clientReqs)
+			devCh, devReqs, err := nch.Accept()
+			if err != nil {
+				clientCh.Close()
+				return
+			}
+			go drainChannelRequests(devReqs)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				splice(ctx, clientCh, devCh, bwUp, bwDown)
+			}()
 		case "x11":
 			if !state.eff.AllowX11Forwarding {
 				nch.Reject(ssh.Prohibited, "x11 forwarding is disabled on this relay")
-				continue
+				return
 			}
 			// The device's sshd opens x11 toward us; re-open toward the
 			// end user's client, which owns the fake-cookie translation.
@@ -225,13 +256,13 @@ func (s *Server) drainDeviceChannels(ctx context.Context, sc *ssh.ServerConn, ca
 			clientCh, clientReqs, err := sc.OpenChannel("x11", nch.ExtraData())
 			if err != nil {
 				nch.Reject(ssh.Prohibited, "could not open x11 channel to client")
-				continue
+				return
 			}
 			go drainChannelRequests(clientReqs)
 			devCh, devReqs, err := nch.Accept()
 			if err != nil {
 				clientCh.Close()
-				continue
+				return
 			}
 			go drainChannelRequests(devReqs)
 			s.wg.Add(1)
@@ -243,13 +274,31 @@ func (s *Server) drainDeviceChannels(ctx context.Context, sc *ssh.ServerConn, ca
 			nch.Reject(ssh.UnknownChannelType, "unsupported channel type from device")
 		}
 	}
-	for req := range ca.devReqs {
-		if req.Type == "keepalive@openssh.com" {
-			req.Reply(true, nil)
-			continue
-		}
-		if req.WantReply {
-			req.Reply(false, nil)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case nch, ok := <-ca.devAgentChans:
+			if !ok {
+				return
+			}
+			accept(nch)
+		case nch, ok := <-ca.devX11Chans:
+			if !ok {
+				return
+			}
+			accept(nch)
+		case req, ok := <-ca.devReqs:
+			if !ok {
+				return
+			}
+			if req.Type == "keepalive@openssh.com" {
+				req.Reply(true, nil)
+				continue
+			}
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
 		}
 	}
 }

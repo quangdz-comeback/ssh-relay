@@ -71,17 +71,25 @@ type Server struct {
 // during the client's authentication) or a pending public key that is
 // completed lazily via the client's forwarded agent (M6 pubkey pass-through).
 type stashedAuth struct {
-	mu         sync.Mutex
-	dev        *ssh.Client
-	devChans   <-chan ssh.NewChannel
-	devReqs    <-chan *ssh.Request
-	binding    *registry.Binding
-	deviceUser string
+	mu  sync.Mutex
+	dev *ssh.Client
+	// The device's sshd opens agent/x11 channels back toward its client
+	// (which is us); the x/crypto mux only delivers opens for types
+	// registered via HandleChannelOpen at dial time (§5.3), so they arrive
+	// on these dedicated sources instead of a shared feeder.
+	devAgentChans <-chan ssh.NewChannel
+	devX11Chans   <-chan ssh.NewChannel
+	devReqs       <-chan *ssh.Request
+	binding       *registry.Binding
+	deviceUser    string
 	// pubkey != nil means the client authenticated with this key but the
 	// device login is still pending; it completes in ensureUpstream through
 	// the client's forwarded ssh-agent (the key never leaves the client).
 	pubkey ssh.PublicKey
-	at     time.Time
+	// pubkeyAuth records that the login used a public key: agent forwarding
+	// (§5.2.1 + session mirroring) activates only for these connections.
+	pubkeyAuth bool
+	at         time.Time
 }
 
 // New builds a Server.
@@ -285,7 +293,7 @@ func (s *Server) authClient(md ssh.ConnMetadata, cls Classification, password st
 		}
 	}
 
-	dev, devChans, devReqs, err := s.dialDevice(md, binding, cls.DeviceUser, password)
+	dev, devAgentChans, devX11Chans, devReqs, err := s.dialDevice(md, binding, cls.DeviceUser, password)
 	if err != nil {
 		release()
 		if password != "" {
@@ -301,12 +309,13 @@ func (s *Server) authClient(md ssh.ConnMetadata, cls Classification, password st
 
 	id := base64.RawStdEncoding.EncodeToString(md.SessionID())
 	s.authStash.Store(id, &stashedAuth{
-		dev:        dev,
-		devChans:   devChans,
-		devReqs:    devReqs,
-		binding:    binding,
-		deviceUser: cls.DeviceUser,
-		at:         time.Now(),
+		dev:           dev,
+		devAgentChans: devAgentChans,
+		devX11Chans:   devX11Chans,
+		devReqs:       devReqs,
+		binding:       binding,
+		deviceUser:    cls.DeviceUser,
+		at:            time.Now(),
 	})
 	// The bridge slot stays held for the whole connection; handleClient owns
 	// the matching ReleaseBridge.
@@ -337,6 +346,7 @@ func (s *Server) authClientPubkey(md ssh.ConnMetadata, cls Classification, key s
 		binding:    binding,
 		deviceUser: cls.DeviceUser,
 		pubkey:     key,
+		pubkeyAuth: true,
 		at:         time.Now(),
 	})
 	return &ssh.Permissions{}, nil
@@ -356,7 +366,7 @@ func (s *Server) popAuth(sc *ssh.ServerConn) (*stashedAuth, bool) {
 // the tunnel wrapped as net.Conn, then an SSH client handshake against the
 // device's sshd. It returns the client plus its inbound channel/request
 // streams (the caller must drain them or the mux stalls).
-func (s *Server) dialDevice(md ssh.ConnMetadata, binding *registry.Binding, deviceUser, password string) (*ssh.Client, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+func (s *Server) dialDevice(md ssh.ConnMetadata, binding *registry.Binding, deviceUser, password string) (*ssh.Client, <-chan ssh.NewChannel, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	var auth []ssh.AuthMethod
 	if password != "" {
 		auth = append(auth, ssh.Password(password))
@@ -365,15 +375,17 @@ func (s *Server) dialDevice(md ssh.ConnMetadata, binding *registry.Binding, devi
 }
 
 // dialDeviceAuth is dialDevice with explicit auth methods (agent-backed
-// publickey signers for the deferred pubkey path).
-func (s *Server) dialDeviceAuth(md ssh.ConnMetadata, binding *registry.Binding, deviceUser string, auth []ssh.AuthMethod) (*ssh.Client, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+// publickey signers for the deferred pubkey path). The returned channel
+// sources are the HandleChannelOpen feeders for the types the device may
+// open back (auth-agent/x11); the caller must drain them.
+func (s *Server) dialDeviceAuth(md ssh.ConnMetadata, binding *registry.Binding, deviceUser string, auth []ssh.AuthMethod) (*ssh.Client, <-chan ssh.NewChannel, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	origin := "relay"
 	if md != nil {
 		origin = sourceIPString(md.RemoteAddr())
 	}
 	nc, err := devconn.DialThrough(binding.Owner, binding.ListenAddr, binding.VirtualPort, origin)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	nc.SetDeadline(time.Now().Add(deviceDialWrap))
 
@@ -389,10 +401,18 @@ func (s *Server) dialDeviceAuth(md ssh.ConnMetadata, binding *registry.Binding, 
 	c, chans, reqs, err := ssh.NewClientConn(nc, "device", cfg)
 	if err != nil {
 		nc.Close()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	nc.SetDeadline(time.Time{})
-	return ssh.NewClient(c, chans, reqs), chans, reqs, nil
+	dev := ssh.NewClient(c, chans, reqs)
+	// Register the reverse channel types before the device's sshd uses
+	// them: unregistered opens are rejected by the client mux itself with
+	// "unknown channel type", which would silently break session agent
+	// forwarding and x11 (ARCHITECTURE §5.3). Everything else stays
+	// mux-rejected — the right default for a public relay.
+	agentChans := dev.HandleChannelOpen("auth-agent@openssh.com")
+	x11Chans := dev.HandleChannelOpen("x11")
+	return dev, agentChans, x11Chans, reqs, nil
 }
 
 // stashJanitor removes auth stash entries whose handshake never completed

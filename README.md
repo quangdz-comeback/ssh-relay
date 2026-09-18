@@ -26,6 +26,14 @@ private key never leaves your machine. Without `-A` the session is refused
 with a hint; password auth needs `-o PubkeyAuthentication=no` once the relay
 has accepted a key.
 
+With a public-key login, `-A` also makes the agent live **inside** the remote
+session — `ssh` hop to further hosts or pull from private git repos from the
+device using your local keys. Password logins refuse agent forwarding
+automatically (`agent forwarding requires public key auth`); there is no
+relay-side flag — your `-A` is the only switch. As with any SSH agent
+forwarding, root on the device can use your agent while connected, so forward
+only to devices you trust.
+
 Design docs: [PLAN.md](PLAN.md) (requirements, milestones, testing) and
 [ARCHITECTURE.md](ARCHITECTURE.md) (two-phase SSH design, policy model,
 limits, security model).

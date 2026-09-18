@@ -12,7 +12,7 @@ import (
 func evalReq(t *testing.T, s *Server, eff policy.Effective, reqType string, payload []byte) (bool, bool, string) {
 	t.Helper()
 	req := &ssh.Request{Type: reqType, WantReply: true, Payload: payload}
-	return s.evalRequest(req, &st{ip: "127.0.0.1", eff: eff})
+	return s.evalRequest(req, &stashedAuth{}, &st{ip: "127.0.0.1", eff: eff})
 }
 
 func sshStr(s string) []byte { return ssh.Marshal(struct{ S string }{s}) }
@@ -65,5 +65,16 @@ func TestEvalRequestGates(t *testing.T) {
 		if fwd, _, _ := evalReq(t, s, gated, rt, []byte{1, 2, 3}); !fwd {
 			t.Fatalf("%s must always be forwarded", rt)
 		}
+	}
+
+	// Agent forwarding activates only for public-key logins: refused with a
+	// reason for password/none logins, mirrored for pubkey ones.
+	if fwd, _, msg := evalReq(t, s, allowed, "auth-agent-req@openssh.com", nil); fwd || !strings.Contains(msg, "requires public key auth") {
+		t.Fatalf("agent gate (password login): fwd=%v msg=%q", fwd, msg)
+	}
+	pubkeyLogin := &stashedAuth{pubkeyAuth: true}
+	req := &ssh.Request{Type: "auth-agent-req@openssh.com", WantReply: true}
+	if fwd, _, _ := s.evalRequest(req, pubkeyLogin, &st{ip: "127.0.0.1", eff: allowed}); !fwd {
+		t.Fatalf("auth-agent-req must forward for pubkey logins")
 	}
 }

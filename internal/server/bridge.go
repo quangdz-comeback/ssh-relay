@@ -68,7 +68,7 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 	go func() {
 		defer wg.Done()
 		for req := range chReqs {
-			forwarded, localOK, localMsg := s.evalRequest(req, state)
+			forwarded, localOK, localMsg := s.evalRequest(req, ca, state)
 			if !forwarded {
 				if localMsg != "" {
 					fmt.Fprintf(clientCh.Stderr(), "relay: %s\r\n", localMsg)
@@ -136,8 +136,9 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 }
 
 // evalRequest decides what happens to a client session request:
-// forwarded (verbatim payload), or answered locally (ok, message).
-func (s *Server) evalRequest(req *ssh.Request, state *st) (forwarded bool, ok bool, msg string) {
+// forwarded (verbatim payload), or answered locally (ok, message). The
+// stashed login decides agent behaviour (public-key logins only, §5.2.1).
+func (s *Server) evalRequest(req *ssh.Request, ca *stashedAuth, state *st) (forwarded bool, ok bool, msg string) {
 	switch req.Type {
 	case "exec":
 		var m execRequestMsg
@@ -173,9 +174,15 @@ func (s *Server) evalRequest(req *ssh.Request, state *st) (forwarded bool, ok bo
 		return true, false, ""
 
 	case "auth-agent-req@openssh.com":
-		// The agent channel itself is accepted in handleClient; v1 does not
-		// use it (M6 pubkey pass-through will).
-		return false, true, ""
+		// The client asked for agent forwarding (-A). It activates only for
+		// public-key logins, where the key is already in play; password/none
+		// logins get an explicit refusal so the client disables forwarding
+		// instead of silently missing the agent. A device that refuses the
+		// mirrored request disables it on its side the same way.
+		if !ca.pubkeyAuth {
+			return false, false, "agent forwarding requires public key auth"
+		}
+		return true, false, ""
 
 	case "break":
 		return false, true, ""

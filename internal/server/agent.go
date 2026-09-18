@@ -25,19 +25,19 @@ func (e *agentLoginError) Unwrap() error { return e.err }
 // The agent channel must stay open until the device handshake finishes: the
 // signature requests arrive mid-handshake, after Signers(). Failures before
 // the dial are wrapped in agentLoginError.
-func (s *Server) completeAgentLogin(sc *ssh.ServerConn, ca *stashedAuth) (*ssh.Client, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
+func (s *Server) completeAgentLogin(sc *ssh.ServerConn, ca *stashedAuth) (*ssh.Client, <-chan ssh.NewChannel, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	ch, _, err := sc.OpenChannel("auth-agent@openssh.com", nil)
 	if err != nil {
-		return nil, nil, nil, &agentLoginError{fmt.Errorf("agent forwarding unavailable (%v) — reconnect with `ssh -A` (and `ssh-add` your key), or use password auth", err)}
+		return nil, nil, nil, nil, &agentLoginError{fmt.Errorf("agent forwarding unavailable (%v) — reconnect with `ssh -A` (and `ssh-add` your key), or use password auth", err)}
 	}
 	signers, err := agent.NewClient(ch).Signers()
 	if err != nil {
 		ch.Close()
-		return nil, nil, nil, &agentLoginError{fmt.Errorf("agent channel failed: %w", err)}
+		return nil, nil, nil, nil, &agentLoginError{fmt.Errorf("agent channel failed: %w", err)}
 	}
 	if len(signers) == 0 {
 		ch.Close()
-		return nil, nil, nil, &agentLoginError{fmt.Errorf("the forwarded agent has no keys — run `ssh-add`, or use password auth")}
+		return nil, nil, nil, nil, &agentLoginError{fmt.Errorf("the forwarded agent has no keys — run `ssh-add`, or use password auth")}
 	}
 	defer ch.Close() // after the handshake: signatures are requested during it
 

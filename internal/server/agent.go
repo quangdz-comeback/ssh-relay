@@ -28,7 +28,7 @@ func (e *agentLoginError) Unwrap() error { return e.err }
 func (s *Server) completeAgentLogin(sc *ssh.ServerConn, ca *stashedAuth) (*ssh.Client, <-chan ssh.NewChannel, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
 	ch, _, err := sc.OpenChannel("auth-agent@openssh.com", nil)
 	if err != nil {
-		return nil, nil, nil, nil, &agentLoginError{fmt.Errorf("agent forwarding unavailable (%v) — reconnect with `ssh -A` (load your key with `ssh-add` or `-o AddKeysToAgent=yes`), or use password auth", err)}
+		return nil, nil, nil, nil, &agentLoginError{fmt.Errorf("agent forwarding unavailable (%v) — reconnect with `ssh -A -o AddKeysToAgent=yes -i <key>` (or `ssh-add` the key first), or use password auth", err)}
 	}
 	signers, err := agent.NewClient(ch).Signers()
 	if err != nil {

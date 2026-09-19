@@ -552,17 +552,20 @@ func TestPubkeyWithoutAgent(t *testing.T) {
 	defer client.Close()
 
 	// No agent handler registered → the relay's agent channel open is
-	// refused → the session open is rejected with actionable text.
-	_, err = client.NewSession()
-	if err == nil {
-		t.Fatalf("session must fail without an agent")
+	// refused → the session is accepted only to carry the explanation: the
+	// reason lands on stderr and the command never reaches the device.
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
 	}
-	var openErr *ssh.OpenChannelError
-	if !errorsAsOpenChannel(err, &openErr) {
-		t.Fatalf("expected channel-open rejection, got %v", err)
+	defer sess.Close()
+	var stderr bytes.Buffer
+	sess.Stderr = &stderr
+	if _, err := sess.Output("echo hi"); err == nil {
+		t.Fatalf("exec must fail without an agent")
 	}
-	if !strings.Contains(openErr.Message, "agent forwarding unavailable") {
-		t.Fatalf("rejection must tell the user to use -A, got: %q", openErr.Message)
+	if !strings.Contains(stderr.String(), "agent forwarding unavailable") {
+		t.Fatalf("stderr must tell the user to use -A, got: %q", stderr.String())
 	}
 }
 
@@ -583,17 +586,19 @@ func TestPubkeyNotAuthorizedOnDevice(t *testing.T) {
 	serveAgent(t, client, clientPriv)
 
 	// The agent offers only the client key, which the device refuses — the
-	// session open is rejected with the device-rejection explanation.
-	_, err = client.NewSession()
-	if err == nil {
-		t.Fatalf("session must fail when the device rejects the key")
+	// session carries the device-rejection explanation on stderr.
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
 	}
-	var openErr *ssh.OpenChannelError
-	if !errorsAsOpenChannel(err, &openErr) {
-		t.Fatalf("expected channel-open rejection, got %v", err)
+	defer sess.Close()
+	var stderr bytes.Buffer
+	sess.Stderr = &stderr
+	if _, err := sess.Output("echo hi"); err == nil {
+		t.Fatalf("exec must fail when the device rejects the key")
 	}
-	if !strings.Contains(openErr.Message, "device rejected your key") {
-		t.Fatalf("rejection must explain the device rejection, got: %q", openErr.Message)
+	if !strings.Contains(stderr.String(), "device rejected your key") {
+		t.Fatalf("stderr must explain the device rejection, got: %q", stderr.String())
 	}
 }
 

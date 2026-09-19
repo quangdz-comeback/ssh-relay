@@ -190,7 +190,7 @@ OUT=$(env "${CLIENT_ENV[@]}" setsid ssh -p "$PORT_RELAY" \
   -o PubkeyAuthentication=yes -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
   "root+$ALIAS@127.0.0.1" 'echo should-not-happen' 2>&1)
 echo "$OUT" | grep -q "agent forwarding unavailable" || { echo "$OUT"; fail "missing -A hint for agentless pubkey"; }
-echo "$OUT" | grep -q "should-not-happen" && fail "agentless pubkey must not open a session"
+echo "$OUT" | grep -x "should-not-happen" && fail "agentless pubkey must not open a session"
 note "agentless pubkey rejected with -A hint OK"
 
 # -A with an EMPTY keyring (plain -i without ssh-add, the common footgun):
@@ -246,7 +246,7 @@ done
 OUT=$(env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" \
   -o PreferredAuthentications=keyboard-interactive \
   "deadtest@127.0.0.1" 'echo should-not-happen' 2>&1)
-echo "$OUT" | grep -q "should-not-happen" && fail "dead tunnel must not open a session"
+echo "$OUT" | grep -x "should-not-happen" && fail "dead tunnel must not open a session"
 echo "$OUT" | grep -q "Permission denied" || { echo "$OUT"; fail "dead tunnel attempt must be refused"; }
 grep -q "auth challenge on missing tunnel" "$WORK/relay.log" || fail "relay did not log the dead-tunnel challenge"
 note "dead-tunnel attempt refused with tunnel-state instruction OK"

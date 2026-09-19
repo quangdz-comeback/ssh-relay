@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -72,12 +73,47 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				nch.Reject(ssh.Prohibited, "only one session per connection")
 				continue
 			}
-			// The device login must exist before the session opens — a
-			// rejected open delivers the reason reliably (like direct-tcpip);
-			// accepting first and failing later would race the client's
-			// exec/shell request against the teardown.
+			// The device login must exist before the session opens. On
+			// failure, accept and explain instead of rejecting: openssh
+			// clients hide channel-open refusals at default log level,
+			// which read as a silently "dead" session. Printing the reason
+			// (with a failing exit status) surfaces it in every terminal
+			// and script.
 			if err := s.ensureUpstream(sc, ca, state); err != nil {
 				sessionOpen = true
+				if ch, chReqs, aerr := nch.Accept(); aerr == nil {
+					fmt.Fprintf(ch.Stderr(), "relay: %v\n", err)
+					// Serve the session long enough to answer the client's
+					// start request, then close it out with a failing
+					// status — closing before the reply races the client's
+					// startup and loses the explanation.
+					go func() {
+						defer ch.Close()
+						served := false
+						timeout := time.After(2 * time.Second)
+						for !served {
+							select {
+							case req, ok := <-chReqs:
+								if !ok {
+									return
+								}
+								switch req.Type {
+								case "exec", "shell":
+									req.Reply(true, nil)
+									served = true
+								default:
+									if req.WantReply {
+										req.Reply(false, nil)
+									}
+								}
+							case <-timeout:
+								return
+							}
+						}
+						ch.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
+					}()
+					continue
+				}
 				nch.Reject(ssh.Prohibited, err.Error())
 				continue
 			}

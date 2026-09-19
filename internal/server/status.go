@@ -117,7 +117,7 @@ func (s *Server) handleStatus(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				req.Reply(true, nil)
 				doc, derr := s.buildStatusDoc(state.ip, true, state.eff)
 				if derr != nil {
-					fmt.Fprintf(ch, "error building status document: %v\r\n", derr)
+					ch.Write(toTerminal([]byte(fmt.Sprintf("error building status document: %v\n", derr)), pty))
 				} else {
 					ch.Write(toTerminal(append(doc, '\n'), pty))
 				}

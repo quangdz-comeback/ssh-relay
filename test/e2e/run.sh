@@ -181,17 +181,19 @@ cat "$WORK/e2e_key.pub" >> /root/.ssh/authorized_keys
 eval "$(ssh-agent -a "$WORK/agent.sock")" >/dev/null
 PIDS="$PIDS $SSH_AGENT_PID"
 
-# Key without the agent: the relay accepts the key but the device login needs
-# the agent → the session open is rejected with the -A hint (openssh only
-# surfaces channel-open refusals at DEBUG).
+# Key without the agent and without -A: the relay accepts the key but never
+# probes the agent (no auth-agent-req signal — probing would make openssh
+# print its agent-forwarding break-in warning) and explains on the live
+# session instead, visible at ANY log level.
 OUT=$(env "${CLIENT_ENV[@]}" setsid ssh -p "$PORT_RELAY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
   -o LogLevel=DEBUG -o BatchMode=yes \
   -o PubkeyAuthentication=yes -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
   "root+$ALIAS@127.0.0.1" 'echo should-not-happen' 2>&1)
-echo "$OUT" | grep -q "agent forwarding unavailable" || { echo "$OUT"; fail "missing -A hint for agentless pubkey"; }
+echo "$OUT" | grep -q "agent forwarding was not requested" || { echo "$OUT"; fail "missing recovery hint for agentless pubkey"; }
+echo "$OUT" | grep -q "ssh server tried agent forwarding" && fail "agentless pubkey must not trigger the probe warning"
 echo "$OUT" | grep -x "should-not-happen" && fail "agentless pubkey must not open a session"
-note "agentless pubkey rejected with -A hint OK"
+note "agentless pubkey refused with recovery hint (no probe) OK"
 
 # -A with an EMPTY keyring (plain -i without ssh-add, the common footgun):
 # refused with the ssh-add / AddKeysToAgent hint (DEBUG, like above).

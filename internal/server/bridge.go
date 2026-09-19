@@ -2,9 +2,9 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
 
@@ -37,13 +37,17 @@ var envAllowlist = map[string]bool{"TERM": true, "LANG": true}
 // mirrorSession splices one end-user session channel to a device-side
 // session: requests are mirrored (with policy gates), data flows through
 // throttled pumps, exit status maps back (255 when the device never sent
-// one), and stderr keeps its extended-data type.
-func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs <-chan *ssh.Request, ca *stashedAuth, state *st, bwUp, bwDown *throttle.Limiter) {
+// one), and stderr keeps its extended-data type. pre holds the setup
+// requests the client sent before its start request (pty-req, env,
+// auth-agent-req, …); they are replayed to the device first. pty carries the
+// session's PTY state so locally generated messages get CRLF endings when a
+// raw-mode terminal (Windows console) is on the other end.
+func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs <-chan *ssh.Request, ca *stashedAuth, state *st, bwUp, bwDown *throttle.Limiter, pre []*ssh.Request, pty *atomic.Bool) {
 	// A raw session channel (not ssh.Session) so we can read the device's
 	// exit-status/exit-signal requests ourselves.
 	devCh, devReqs, err := ca.dev.OpenChannel("session", nil)
 	if err != nil {
-		fmt.Fprintf(clientCh.Stderr(), "relay: could not open device session: %v\r\n", err)
+		clientCh.Stderr().Write(toTerminal([]byte("relay: could not open device session: "+err.Error()+"\n"), pty.Load()))
 		clientCh.SendRequest("exit-status", false, ssh.Marshal(exitStatusMsg{Status: 255}))
 		clientCh.Close()
 		return
@@ -53,9 +57,9 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Control goroutines (request mirroring + exit mapping).
+	// Control goroutines (exit mapping) + data pumps.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 
 	// Data pumps: exit ordering matters — after the device session ends we
 	// send exit-status, then wait for stdout/stderr to drain before closing
@@ -64,32 +68,33 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 	var pumpWg sync.WaitGroup
 	pumpWg.Add(3)
 
-	// Client → device request mirroring (pty, shell, exec, env, x11, …).
-	go func() {
-		defer wg.Done()
-		for req := range chReqs {
-			forwarded, localOK, localMsg := s.evalRequest(req, ca, state)
-			if !forwarded {
-				if localMsg != "" {
-					fmt.Fprintf(clientCh.Stderr(), "relay: %s\r\n", localMsg)
-				}
-				if req.WantReply {
-					req.Reply(localOK, nil)
-				}
-				continue
+	// mirrorOne evaluates one request against policy, forwards it to the
+	// device, and relays the device's answer; refused requests get their
+	// message on the client's stderr. Returns false once the device
+	// connection is gone; the pumps will notice too.
+	mirrorOne := func(req *ssh.Request) bool {
+		forwarded, localOK, localMsg := s.evalRequest(req, ca, state)
+		if !forwarded {
+			if localMsg != "" {
+				clientCh.Stderr().Write(toTerminal([]byte("relay: "+localMsg+"\n"), pty.Load()))
 			}
-			res, rerr := devCh.SendRequest(req.Type, req.WantReply, req.Payload)
 			if req.WantReply {
-				if rerr != nil {
-					req.Reply(false, nil)
-					return // device connection is gone; the pumps will notice too
-				}
-				req.Reply(res, nil)
-			} else if rerr != nil {
-				return
+				req.Reply(localOK, nil)
 			}
+			return true
 		}
-	}()
+		res, rerr := devCh.SendRequest(req.Type, req.WantReply, req.Payload)
+		if req.WantReply {
+			if rerr != nil {
+				req.Reply(false, nil)
+				return false // device connection is gone; the pumps will notice too
+			}
+			req.Reply(res, nil)
+		} else if rerr != nil {
+			return false
+		}
+		return true
+	}
 
 	// stdin (client → device, throttled).
 	go func() {
@@ -131,6 +136,28 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 		pumpWg.Wait()
 		clientCh.Close()
 	}()
+
+	// Replay the buffered setup requests. pty-req was already answered
+	// locally (the client blocks on its reply), so only the device-side
+	// allocation happens here; everything else behaves like a live request.
+	for _, req := range pre {
+		if req.Type == "pty-req" {
+			if _, err := devCh.SendRequest("pty-req", true, req.Payload); err != nil {
+				break
+			}
+			continue
+		}
+		if !mirrorOne(req) {
+			break
+		}
+	}
+
+	// Live requests from here on.
+	for req := range chReqs {
+		if !mirrorOne(req) {
+			break
+		}
+	}
 
 	wg.Wait()
 }

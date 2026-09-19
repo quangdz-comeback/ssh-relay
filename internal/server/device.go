@@ -141,7 +141,7 @@ func (s *Server) runControlShell(ctx context.Context, sc *ssh.ServerConn, ch ssh
 		if jsonMode {
 			doc, err := s.buildStatusDoc(state.ip, true, state.eff)
 			if err != nil {
-				fmt.Fprintf(ch, "error building status document: %v\r\n", err)
+				ch.Write(toTerminal([]byte(fmt.Sprintf("error building status document: %v\n", err)), pty.Load()))
 				return
 			}
 			ch.Write(toTerminal(doc, pty.Load()))
@@ -203,11 +203,13 @@ func (s *Server) runControlShell(ctx context.Context, sc *ssh.ServerConn, ch ssh
 }
 
 // toTerminal converts LF to CRLF when the client side is a raw-mode terminal.
-// Piped clients (automation) keep plain LF so `| jq` stays clean.
+// Piped clients (automation) keep plain LF so `| jq` stays clean. Existing
+// CRLF sequences are preserved, never doubled.
 func toTerminal(b []byte, pty bool) []byte {
 	if !pty {
 		return b
 	}
+	b = bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n"))
 	return bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n"))
 }
 

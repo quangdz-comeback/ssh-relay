@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
-	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -73,60 +72,78 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				nch.Reject(ssh.Prohibited, "only one session per connection")
 				continue
 			}
-			// The device login must exist before the session opens. On
-			// failure, accept and explain instead of rejecting: openssh
-			// clients hide channel-open refusals at default log level,
-			// which read as a silently "dead" session. Printing the reason
-			// (with a failing exit status) surfaces it in every terminal
-			// and script.
-			if err := s.ensureUpstream(sc, ca, state); err != nil {
-				sessionOpen = true
-				if ch, chReqs, aerr := nch.Accept(); aerr == nil {
-					fmt.Fprintf(ch.Stderr(), "relay: %v\n", err)
-					// Serve the session long enough to answer the client's
-					// start request, then close it out with a failing
-					// status — closing before the reply races the client's
-					// startup and loses the explanation.
-					go func() {
-						defer ch.Close()
-						served := false
-						timeout := time.After(2 * time.Second)
-						for !served {
-							select {
-							case req, ok := <-chReqs:
-								if !ok {
-									return
-								}
-								switch req.Type {
-								case "exec", "shell":
-									req.Reply(true, nil)
-									served = true
-								default:
-									if req.WantReply {
-										req.Reply(false, nil)
-									}
-								}
-							case <-timeout:
-								return
-							}
-						}
-						ch.SendRequest("exit-status", false, []byte{0, 0, 0, 1})
-					}()
-					continue
-				}
-				nch.Reject(ssh.Prohibited, err.Error())
-				continue
-			}
-			startDrain()
-			ch, chReqs, err := nch.Accept()
-			if err != nil {
+			// Accept first: openssh hides channel-open refusals at default
+			// log level, which read as a silently "dead" session. Every
+			// login problem is explained on the live session instead.
+			ch, chReqs, aerr := nch.Accept()
+			if aerr != nil {
 				continue
 			}
 			sessionOpen = true
+
+			// Buffer the setup requests until the client asks to start
+			// (exec/shell/subsystem); mirrorSession replays them to the
+			// device so the bridged session is indistinguishable from a
+			// direct one. pty-req is answered immediately — the client
+			// blocks on its reply. auth-agent-req is the protocol's only
+			// "-A" signal: the relay opens the agent channel back only
+			// after seeing it, because an unconditional open makes openssh
+			// print its "agent forwarding break-in attempt" warning.
+			pty := new(atomic.Bool)
+			agentReq := agentNotWanted // upgraded to agentWanted by auth-agent-req
+			var pre []*ssh.Request
+			start := (*ssh.Request)(nil)
+		loop:
+			for req := range chReqs {
+				switch req.Type {
+				case "exec", "shell", "subsystem":
+					start = req
+					pre = append(pre, req)
+					break loop
+				case "pty-req":
+					pty.Store(true)
+					req.Reply(true, nil)
+					pre = append(pre, req)
+				case "auth-agent-req@openssh.com":
+					if ca.pubkeyAuth {
+						agentReq = agentWanted
+						req.Reply(true, nil)   // want_reply is unset; answer now so -A clients never stall
+						pre = append(pre, req) // replayed: wires the device's SSH_AUTH_SOCK
+					} else {
+						req.Reply(false, nil)
+						ch.Stderr().Write([]byte("relay: agent forwarding requires public key auth\r\n"))
+					}
+				default:
+					// mirrors evalRequest's default refusal — unknown
+					// requests are never forwarded
+					if req.WantReply {
+						req.Reply(false, nil)
+					}
+				}
+			}
+			if start == nil {
+				ch.Close() // client vanished before starting a session
+				continue
+			}
+
+			if err := s.ensureUpstream(sc, ca, state, agentReq); err != nil {
+				// Explain on the live session: the reason goes to the
+				// client's terminal (CRLF under a PTY — Windows consoles do
+				// not translate bare \n), the start request is answered,
+				// then the session closes with a failing exit status.
+				// Closing before the reply races the client's startup and
+				// loses the explanation.
+				start.Reply(true, nil)
+				ch.Stderr().Write(toTerminal([]byte("relay: "+err.Error()+"\n"), pty.Load()))
+				ch.SendRequest("exit-status", false, ssh.Marshal(exitStatusMsg{Status: 1}))
+				ch.Close()
+				continue
+			}
+			startDrain()
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
-				s.mirrorSession(ctx, ch, chReqs, ca, state, bwUp, bwDown)
+				s.mirrorSession(ctx, ch, chReqs, ca, state, bwUp, bwDown, pre, pty)
 			}()
 
 		case "direct-tcpip":
@@ -134,7 +151,7 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 				nch.Reject(ssh.Prohibited, TCPForwardWarning)
 				continue
 			}
-			if err := s.ensureUpstream(sc, ca, state); err != nil {
+			if err := s.ensureUpstream(sc, ca, state, agentUnknown); err != nil {
 				nch.Reject(ssh.Prohibited, err.Error())
 				continue
 			}
@@ -173,13 +190,19 @@ func (s *Server) handleClient(ctx context.Context, sc *ssh.ServerConn, chans <-c
 // ensureUpstream completes the device login for public-key authenticated
 // connections: the client's forwarded agent signs the device's challenge, so
 // the device still authenticates the user's real key. Password/none
-// connections already have their upstream and return immediately. Safe for
-// concurrent session/direct-tcpip use.
-func (s *Server) ensureUpstream(sc *ssh.ServerConn, ca *stashedAuth, state *st) error {
+// connections already have their upstream and return immediately. agentReq
+// carries the session's auth-agent-req signal: without it the relay never
+// probes the agent (an open attempt would make openssh print its
+// agent-forwarding break-in warning) and returns the recovery hint instead.
+// Safe for concurrent session/direct-tcpip use.
+func (s *Server) ensureUpstream(sc *ssh.ServerConn, ca *stashedAuth, state *st, agentReq agentRequest) error {
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
 	if ca.pubkey == nil {
 		return nil // established at auth time, or by a racing channel open
+	}
+	if agentReq == agentNotWanted {
+		return &agentLoginError{errors.New(agentNotRequestedHint)}
 	}
 	dev, devAgentChans, devX11Chans, devReqs, err := s.completeAgentLogin(sc, ca)
 	if err != nil {

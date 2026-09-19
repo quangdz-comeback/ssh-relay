@@ -13,12 +13,13 @@ func TestToTerminal(t *testing.T) {
 		t.Fatalf("no-pty output must keep LF: %q", got)
 	}
 	got := toTerminal(in, true)
-	if bytes.Contains(got, []byte("\n")) && bytes.Contains(got, []byte("\r\n")) {
-		if !bytes.Equal(got, []byte("a\r\nb\r\nc\r\n")) {
-			t.Fatalf("pty output = %q, want CRLF", got)
-		}
-	} else {
-		t.Fatalf("pty output must use CRLF: %q", got)
+	if !bytes.Equal(got, []byte("a\r\nb\r\nc\r\n")) {
+		t.Fatalf("pty output = %q, want CRLF", got)
+	}
+	// Pre-existing CRLF must not be doubled (error text may carry \r\n).
+	crlf := []byte("a\r\nb\r\n")
+	if got := toTerminal(crlf, true); !bytes.Equal(got, crlf) {
+		t.Fatalf("existing CRLF must be preserved: %q", got)
 	}
 }
 

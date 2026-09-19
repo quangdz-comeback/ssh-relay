@@ -298,18 +298,33 @@ does not make a relay-local decision; it *performs the device login*:
    channel only exists once the client's session setup starts. A missing
    tunnel or full bridge slot still rejects here, so the client falls back to
    password auth exactly like before.
-2. **Completion phase.** When the client opens a `session` or `direct-tcpip`
-   channel, the relay opens `auth-agent@openssh.com` toward the client
-   (openssh answers it when `-A`/`ForwardAgent` is on — also with `-N`), lists
-   the agent's signers, orders the client-authenticated key first, and dials
-   the device with those publickeys. The agent channel stays open until the
-   handshake finishes: signature requests arrive mid-handshake. The device
-   applies its own `authorized_keys` policy — the relay adds no trust.
-3. **Failure mapping.** No agent / empty keyring → the open is rejected with
-   the `-A` + `ssh-add` / `-o AddKeysToAgent=yes` hint (user setup mistake,
-   never a fail2ban failure); the device refusing every offered key →
-   rejected with the `authorized_keys` hint and counted as a credential
-   failure.
+2. **Completion phase.** When the client opens a `session` channel, the relay
+   accepts it and reads the setup requests first: `auth-agent-req@openssh.com`
+   is the protocol's only `-A` signal, and the relay opens
+   `auth-agent@openssh.com` toward the client **only after seeing it** — an
+   unconditional open makes openssh print its "agent forwarding break-in
+   attempt" warning. With the signal present the relay lists the agent's
+   signers, orders the client-authenticated key first, and dials the device
+   with those publickeys. The agent channel stays open until the handshake
+   finishes: signature requests arrive mid-handshake. The buffered setup
+   requests (pty-req, env, auth-agent-req) are replayed to the device session,
+   so the bridge is indistinguishable from a direct one (the replayed
+   pty-req's reply stays local — the client blocks on it). `direct-tcpip`
+   logins have no session to carry the signal and probe the agent as before.
+   The device applies its own `authorized_keys` policy — the relay adds no
+   trust.
+3. **Failure mapping.** A session that starts without the auth-agent-req
+   signal is not probed at all: the relay answers the client's start request,
+   prints the recovery hint on the live session's stderr (CRLF under a PTY),
+   and closes with exit status 1 — no openssh warning noise, visible at every
+   log level. Agent present but unreachable / empty keyring → the `-A` +
+   `ssh-add` / `-o AddKeysToAgent=yes` hint (user setup mistake, never a
+   fail2ban failure); the device refusing every offered key → the
+   `authorized_keys` hint, counted as a credential failure. Every hint ends
+   with the password escape `ssh -o PubkeyAuthentication=no <user>@<host>`:
+   clients offer their default keys automatically, so a "password" user often
+   reaches the pubkey path without knowing it (their key was accepted, and no
+   password prompt ever appeared).
 4. **Inside the session.** On a public-key login the relay also mirrors the
    client's `auth-agent-req@openssh.com` to the device session and pairs the
    device's `auth-agent@openssh.com` opens back to the client, so the agent is
@@ -414,7 +429,7 @@ requests.
 
 | Incoming | Gate | Behavior |
 |---|---|---|
-| channel open `session` | alias live + caps | bridge (§5); pubkey connections complete the deferred agent login first (§5.2.1) — an open rejection carries the reason |
+| channel open `session` | alias live + caps | bridge (§5); pubkey connections complete the deferred agent login after the client's `auth-agent-req` signal (§5.2.1) — failures are explained on the live session (reason on stderr, exit 1) |
 | channel open `direct-tcpip` (`-L`, `-D`) | `--allow-tcp-forwarding` (effective, §6.3) + channel cap | mirror as `direct-tcpip` on the Phase-2 device connection (device dials); splice with throttle; device-side open failures relayed back verbatim; when gated off, refusal with `[WARNING] TCP forwarding is not supported.`; pubkey connections complete the deferred agent login here as well |
 | global `tcpip-forward` (`-R <port>:…` from the client) | **denied** | request-failure, reason `[WARNING] TCP forwarding is not supported.` |
 | global `cancel-tcpip-forward` | — | ack, no-op |

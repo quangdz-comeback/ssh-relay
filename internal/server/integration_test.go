@@ -525,6 +525,11 @@ func TestPubkeyAgentBridgeExec(t *testing.T) {
 		t.Fatalf("session: %v", err)
 	}
 	defer sess.Close()
+	// The `-A` signal (real openssh sends it): only then does the relay
+	// open the agent channel back and complete the deferred login.
+	if ok, err := sess.SendRequest("auth-agent-req@openssh.com", true, nil); err != nil || !ok {
+		t.Fatalf("auth-agent-req must be accepted for pubkey logins (ok=%v err=%v)", ok, err)
+	}
 	out, err := sess.Output("echo hi")
 	if err != nil {
 		t.Fatalf("exec through agent bridge: %v", err)
@@ -551,9 +556,9 @@ func TestPubkeyWithoutAgent(t *testing.T) {
 	}
 	defer client.Close()
 
-	// No agent handler registered → the relay's agent channel open is
-	// refused → the session is accepted only to carry the explanation: the
-	// reason lands on stderr and the command never reaches the device.
+	// No agent handler and no auth-agent-req (no `ssh -A`) → the relay
+	// neither probes the agent nor opens the device: the session carries the
+	// recovery hint on stderr and the command never reaches the device.
 	sess, err := client.NewSession()
 	if err != nil {
 		t.Fatalf("session: %v", err)
@@ -561,6 +566,39 @@ func TestPubkeyWithoutAgent(t *testing.T) {
 	defer sess.Close()
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
+	if _, err := sess.Output("echo hi"); err == nil {
+		t.Fatalf("exec must fail without an agent")
+	}
+	if !strings.Contains(stderr.String(), "agent forwarding was not requested") {
+		t.Fatalf("stderr must tell the user to use -A or PubkeyAuthentication=no, got: %q", stderr.String())
+	}
+}
+
+// TestPubkeyAgentRequestedButUnavailable: `ssh -A` whose agent cannot be
+// reached (no channel handler) still gets the -A hint — the request signal
+// justifies the probe attempt.
+func TestPubkeyAgentRequestedButUnavailable(t *testing.T) {
+	h := newHarness(t, nil)
+	clientSigner, _ := newEdSigner(t)
+	dev := &fakeDevice{pubkey: clientSigner.PublicKey(), pubkeyOnly: true}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{ssh.PublicKeys(clientSigner)})
+	if err != nil {
+		t.Fatalf("pubkey client auth: %v", err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	defer sess.Close()
+	var stderr bytes.Buffer
+	sess.Stderr = &stderr
+	if ok, err := sess.SendRequest("auth-agent-req@openssh.com", true, nil); err != nil || !ok {
+		t.Fatalf("auth-agent-req must be accepted for pubkey logins (ok=%v err=%v)", ok, err)
+	}
 	if _, err := sess.Output("echo hi"); err == nil {
 		t.Fatalf("exec must fail without an agent")
 	}
@@ -594,6 +632,10 @@ func TestPubkeyNotAuthorizedOnDevice(t *testing.T) {
 	defer sess.Close()
 	var stderr bytes.Buffer
 	sess.Stderr = &stderr
+	// The `-A` signal: without it the relay skips the agent probe entirely.
+	if ok, err := sess.SendRequest("auth-agent-req@openssh.com", true, nil); err != nil || !ok {
+		t.Fatalf("auth-agent-req must be accepted for pubkey logins (ok=%v err=%v)", ok, err)
+	}
 	if _, err := sess.Output("echo hi"); err == nil {
 		t.Fatalf("exec must fail when the device rejects the key")
 	}

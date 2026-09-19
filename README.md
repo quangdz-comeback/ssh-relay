@@ -15,10 +15,12 @@ user:     ssh d-xxx@relay.example.com            # root on the device
 
 Public key auth: an SSH signature binds the session it was made on, so the
 relay cannot replay your key to the device. Instead it forwards your agent:
-load your key (`ssh-add ~/.ssh/key`) and connect with `-A`:
+connect with `-A` and make sure the key is loaded — run `ssh-add ~/.ssh/key`
+once, or add `-o AddKeysToAgent=yes` so `ssh -i` keys land in the agent
+automatically during login (no ssh-add needed):
 
 ```
-ssh -A -i ~/.ssh/key d-xxx@relay.example.com
+ssh -A -o AddKeysToAgent=yes -i ~/.ssh/key d-xxx@relay.example.com
 ```
 
 The device still verifies your real key against its `authorized_keys`; the

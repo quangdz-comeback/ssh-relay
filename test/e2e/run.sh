@@ -3,8 +3,9 @@
 #   device (real sshd, password auth) --ssh -R--> relay <--ssh-- end user
 # Covers: auto-ID registration banner, password bridge exec (root + user+alias),
 # status JSON endpoint, TCP-forwarding refusal warning, custom alias,
-# pubkey login via a real ssh-agent (-A), agentless refusal hint, and agent
-# forwarding inside the session (ssh hop from the device with the agent).
+# pubkey login paths (agentless hint, empty-keyring hint, -A with
+# -o AddKeysToAgent=yes), and agent forwarding inside the session (ssh hop
+# from the device with the agent).
 set -u
 
 cd "$(dirname "$0")/../.."
@@ -169,23 +170,20 @@ note "custom alias OK"
 
 # ---------- pubkey pass-through via agent forwarding (M6) ----------
 # The device accepts a key the user keeps in an agent; the relay forwards the
-# agent so the device verifies the real key (ARCHITECTURE §5).
+# agent so the device verifies the real key (ARCHITECTURE §5). The agent below
+# starts EMPTY and no ssh-add runs until the hop, so the scenarios walk the
+# real user paths: no -A, -A with an empty keyring (plain -i), and the
+# recommended -A -o AddKeysToAgent=yes workflow.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/e2e_key" >/dev/null 2>&1
 mkdir -p /root/.ssh && chmod 700 /root/.ssh
 cp /root/.ssh/authorized_keys /root/.ssh/authorized_keys.pre-e2e 2>/dev/null || true
 cat "$WORK/e2e_key.pub" >> /root/.ssh/authorized_keys
 eval "$(ssh-agent -a "$WORK/agent.sock")" >/dev/null
 PIDS="$PIDS $SSH_AGENT_PID"
-ssh-add "$WORK/e2e_key" >/dev/null
-OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" ssh "${SSH_OPTS[@]}" -A \
-  -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
-  "root+$ALIAS@127.0.0.1" 'echo pubkey-agent-e2e-ok' 2>&1)
-echo "$OUT" | grep -q "pubkey-agent-e2e-ok" || { echo "$OUT"; fail "pubkey + agent bridge failed"; }
-note "pubkey via agent forwarding OK"
 
-# Same key WITHOUT the agent: the relay accepts the key but the device login
-# needs the agent → the session open is rejected with the -A hint (openssh
-# only surfaces channel-open refusals at DEBUG).
+# Key without the agent: the relay accepts the key but the device login needs
+# the agent → the session open is rejected with the -A hint (openssh only
+# surfaces channel-open refusals at DEBUG).
 OUT=$(env "${CLIENT_ENV[@]}" setsid ssh -p "$PORT_RELAY" \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
   -o LogLevel=DEBUG -o BatchMode=yes \
@@ -195,8 +193,30 @@ echo "$OUT" | grep -q "agent forwarding unavailable" || { echo "$OUT"; fail "mis
 echo "$OUT" | grep -q "should-not-happen" && fail "agentless pubkey must not open a session"
 note "agentless pubkey rejected with -A hint OK"
 
+# -A with an EMPTY keyring (plain -i without ssh-add, the common footgun):
+# refused with the ssh-add / AddKeysToAgent hint (DEBUG, like above).
+OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" ssh -p "$PORT_RELAY" \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+  -o LogLevel=DEBUG -o BatchMode=yes -A \
+  -o AddKeysToAgent=no -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
+  "root+$ALIAS@127.0.0.1" 'echo should-not-happen' 2>&1)
+echo "$OUT" | grep -q "has no keys" || { echo "$OUT"; fail "missing empty-keyring hint"; }
+echo "$OUT" | grep -q "pubkey-agent-e2e-ok" && fail "empty keyring must not open a session"
+note "empty-keyring pubkey refused with hint OK"
+
+# Recommended workflow: -A -o AddKeysToAgent=yes drops the -i key into the
+# agent during client auth — before the relay needs it — so plain -i works.
+OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" ssh "${SSH_OPTS[@]}" -A \
+  -o AddKeysToAgent=yes -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
+  "root+$ALIAS@127.0.0.1" 'echo addkeys-agent-e2e-ok' 2>&1)
+echo "$OUT" | grep -q "addkeys-agent-e2e-ok" || { echo "$OUT"; fail "pubkey via AddKeysToAgent failed"; }
+note "pubkey via -o AddKeysToAgent=yes OK"
+
 # Agent forwarding inside the session (pubkey login): from the device, hop to
 # a second ssh using the forwarded agent — SSH_AUTH_SOCK must be live there.
+# ssh-add pins the agent state explicitly (AddKeysToAgent above may or may not
+# have left the key depending on the local client version).
+ssh-add "$WORK/e2e_key" >/dev/null 2>&1 || true
 OUT=$(env SSH_AUTH_SOCK="$WORK/agent.sock" timeout 20 ssh "${SSH_OPTS[@]}" -A \
   -o IdentitiesOnly=yes -i "$WORK/e2e_key" \
   "root+$ALIAS@127.0.0.1" \

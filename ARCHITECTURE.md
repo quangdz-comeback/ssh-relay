@@ -306,9 +306,10 @@ does not make a relay-local decision; it *performs the device login*:
    handshake finishes: signature requests arrive mid-handshake. The device
    applies its own `authorized_keys` policy — the relay adds no trust.
 3. **Failure mapping.** No agent / empty keyring → the open is rejected with
-   the `-A` + `ssh-add` hint (user setup mistake, never a fail2ban failure);
-   the device refusing every offered key → rejected with the `authorized_keys`
-   hint and counted as a credential failure.
+   the `-A` + `ssh-add` / `-o AddKeysToAgent=yes` hint (user setup mistake,
+   never a fail2ban failure); the device refusing every offered key →
+   rejected with the `authorized_keys` hint and counted as a credential
+   failure.
 4. **Inside the session.** On a public-key login the relay also mirrors the
    client's `auth-agent-req@openssh.com` to the device session and pairs the
    device's `auth-agent@openssh.com` opens back to the client, so the agent is

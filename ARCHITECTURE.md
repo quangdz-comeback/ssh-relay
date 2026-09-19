@@ -287,7 +287,7 @@ does not make a relay-local decision; it *performs the device login*:
 |---|---|---|
 | `none` | try device `none` (passwordless sshd) | respond auth-failure to client (client falls through to password) |
 | `password` | try device `password` with the received password | respond auth-failure; count for fail2ban |
-| `keyboard-interactive` | collect answers, try device `password` then `keyboard-interactive` | same |
+| `keyboard-interactive` | check the tunnel first: missing/saturated tunnels are named in the challenge instruction (`No live tunnel for …` / `session capacity`) and the answer is refused without dialing; a live tunnel collects answers and tries device `password` then `keyboard-interactive` | same |
 | `publickey` | accept the key (x/crypto verifies the client's signature over the relay session ID) and **defer** the device login: at the first session/forwarding open, the relay opens `auth-agent@openssh.com` back to the client and the forwarded agent signs the device's challenge (§5.2) | session/forward open rejected with the reason; agentless key = `-A` hint (never counts for fail2ban), device refusal = fail2ban failure |
 | `hostbased` | reject | — |
 

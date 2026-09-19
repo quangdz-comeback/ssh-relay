@@ -225,6 +225,32 @@ echo "$OUT" | grep -q "hop-agent-e2e-ok" || { echo "$OUT"; fail "agent forwardin
 note "agent forwarding inside session OK"
 
 kill "$REG_PID" "$REG2_PID" 2>/dev/null
+
+# ---------- dead-tunnel auth UX ----------
+# A gone device must not look like a bad password: the keyboard-interactive
+# challenge names the dead tunnel, the attempt fails fast, and the relay logs
+# it (the instruction text itself only renders on a real user TTY).
+ssh "${SSH_OPTS[@]}" -T -R deadtest:0:127.0.0.1:$PORT_SSHD ssh@127.0.0.1 > "$WORK/deadbanner.txt" 2>/dev/null &
+DEAD_PID=$!
+PIDS="$PIDS $DEAD_PID"
+for i in $(seq 1 50); do grep -q "deadtest" "$WORK/deadbanner.txt" 2>/dev/null && break; sleep 0.1; done
+grep -q "deadtest" "$WORK/deadbanner.txt" || fail "deadtest tunnel never registered"
+kill "$DEAD_PID" 2>/dev/null
+DEAD_GONE=0
+for i in $(seq 1 50); do
+  OUT=$(env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" "json@127.0.0.1" 'true' 2>/dev/null)
+  echo "$OUT" | grep -q deadtest || { DEAD_GONE=1; break; }
+  sleep 0.1
+done
+[ "$DEAD_GONE" = 1 ] || fail "deadtest tunnel still listed after owner death"
+OUT=$(env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" \
+  -o PreferredAuthentications=keyboard-interactive \
+  "deadtest@127.0.0.1" 'echo should-not-happen' 2>&1)
+echo "$OUT" | grep -q "should-not-happen" && fail "dead tunnel must not open a session"
+echo "$OUT" | grep -q "Permission denied" || { echo "$OUT"; fail "dead tunnel attempt must be refused"; }
+grep -q "auth challenge on missing tunnel" "$WORK/relay.log" || fail "relay did not log the dead-tunnel challenge"
+note "dead-tunnel attempt refused with tunnel-state instruction OK"
+
 # restore authorized_keys to its pre-test state (remove only our key line)
 if [ -f /root/.ssh/authorized_keys.pre-e2e ]; then
   mv /root/.ssh/authorized_keys.pre-e2e /root/.ssh/authorized_keys

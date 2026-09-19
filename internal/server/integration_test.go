@@ -1052,3 +1052,52 @@ func TestFail2banBansPasswordGuessers(t *testing.T) {
 		t.Fatalf("banned IP must not authenticate")
 	}
 }
+
+// ---------- keyboard-interactive tunnel-state instruction ----------
+
+type stubConnMeta struct{ user string }
+
+func (m stubConnMeta) User() string          { return m.user }
+func (m stubConnMeta) SessionID() []byte     { return []byte("sess") }
+func (m stubConnMeta) ClientVersion() []byte { return []byte("SSH-2.0-test") }
+func (m stubConnMeta) ServerVersion() []byte { return []byte("SSH-2.0-relay") }
+func (m stubConnMeta) RemoteAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 5} }
+func (m stubConnMeta) LocalAddr() net.Addr   { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 22} }
+
+// The keyboard-interactive instruction is the only text a plain ssh client
+// shows during auth, so it must name the tunnel state instead of always
+// asking for a device password.
+func TestKbdInteractiveInstructionReflectsTunnelState(t *testing.T) {
+	h := newHarness(t, nil)
+	cfg := h.srv.serverConfig()
+	challenge := func() (string, error) {
+		var instruction string
+		_, err := cfg.KeyboardInteractiveCallback(stubConnMeta{user: "root+box"}, func(name, instr string, questions []string, echos []bool) ([]string, error) {
+			instruction = instr
+			return nil, fmt.Errorf("user aborted") // never dial a device from this test
+		})
+		return instruction, err
+	}
+
+	instruction, _ := challenge()
+	if !strings.Contains(instruction, `No live tunnel for "box"`) {
+		t.Fatalf("dead-tunnel instruction = %q", instruction)
+	}
+
+	if _, err := h.registry.Bind("box", nil, "9.9.9.9", "127.0.0.1:22", 22, 1); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	instruction, _ = challenge()
+	if !strings.Contains(instruction, "Device login required.") {
+		t.Fatalf("live-tunnel instruction = %q", instruction)
+	}
+
+	binding, ok := h.registry.Lookup("box")
+	if !ok || !binding.AcquireBridge() {
+		t.Fatalf("acquire")
+	}
+	instruction, _ = challenge()
+	if !strings.Contains(instruction, "session capacity") {
+		t.Fatalf("capacity instruction = %q", instruction)
+	}
+}

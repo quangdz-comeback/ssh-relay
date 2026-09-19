@@ -246,9 +246,16 @@ func (s *Server) serverConfig() *ssh.ServerConfig {
 			case RoleDevice, RoleDeviceJSON, RoleStatus:
 				return &ssh.Permissions{}, nil
 			case RoleClient:
-				answers, err := challenger(md.User(), "Device login required.", []string{"Password:"}, []bool{true})
+				// The instruction is the only text a plain ssh client shows
+				// during auth, so it must name the real problem: a dead
+				// tunnel used to fall through to a pointless password loop.
+				instruction, canProceed := s.deviceChallengeInstruction(md, cls)
+				answers, err := challenger(md.User(), instruction, []string{"Password:"}, []bool{true})
 				if err != nil || len(answers) == 0 {
 					return nil, fmt.Errorf("no answer provided")
+				}
+				if !canProceed {
+					return nil, fmt.Errorf("%s", instruction)
 				}
 				return s.authClient(md, cls, answers[0])
 			}
@@ -270,6 +277,26 @@ func (s *Server) serverConfig() *ssh.ServerConfig {
 	}
 	cfg.AddHostKey(s.deps.HostKey)
 	return cfg
+}
+
+// deviceChallengeInstruction decides what the keyboard-interactive challenge
+// tells the end user (ARCHITECTURE §5.2). The bool is false when no password
+// can succeed right now — the answer is then discarded and the instruction
+// becomes the auth error: the device's tunnel is gone or its session slots
+// are full, which is the device owner's to fix, not a credential problem.
+func (s *Server) deviceChallengeInstruction(md ssh.ConnMetadata, cls Classification) (string, bool) {
+	binding, ok := s.deps.Registry.Lookup(cls.Alias)
+	if !ok {
+		s.log.Info("auth challenge on missing tunnel", "ip", sourceIPString(md.RemoteAddr()), "alias", cls.Alias)
+		return fmt.Sprintf("No live tunnel for %q — the device is disconnected. Re-run the ssh -R registration on the device, then retry (password prompts cannot succeed until then).", cls.Alias), false
+	}
+	if !binding.AcquireBridge() {
+		s.log.Warn("auth challenge on saturated tunnel", "ip", sourceIPString(md.RemoteAddr()), "alias", cls.Alias, "limit", binding.MaxBridges)
+		return fmt.Sprintf("Tunnel %q is at its session capacity — try again later.", cls.Alias), false
+	}
+	// Peek slot only; authClient re-acquires for the real connection.
+	binding.ReleaseBridge()
+	return "Device login required.", true
 }
 
 // authClient performs the pass-through device login. password may be empty to

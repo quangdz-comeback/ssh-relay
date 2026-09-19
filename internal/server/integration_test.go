@@ -26,6 +26,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 
+	"github.com/quangdz/ssh-relay/internal/config"
 	"github.com/quangdz/ssh-relay/internal/devconn"
 	"github.com/quangdz/ssh-relay/internal/guard"
 	"github.com/quangdz/ssh-relay/internal/policy"
@@ -1099,5 +1100,54 @@ func TestKbdInteractiveInstructionReflectsTunnelState(t *testing.T) {
 	instruction, _ = challenge()
 	if !strings.Contains(instruction, "session capacity") {
 		t.Fatalf("capacity instruction = %q", instruction)
+	}
+}
+
+// ---------- graceful shutdown (panel stop) ----------
+
+// A stopping relay must tear down its live connections instead of waiting
+// for them: idle tunnel owners never disconnect on their own, and a panel
+// SIGKILLs the process after its own stop timeout.
+func TestServeGracefulShutdownClosesLiveConnections(t *testing.T) {
+	old := shutdownGrace
+	shutdownGrace = 500 * time.Millisecond
+	t.Cleanup(func() { shutdownGrace = old })
+
+	s := New(Deps{
+		Cfg:           &config.Config{ListenPort: 22},
+		BasePolicy:    policy.Effective{},
+		Policy:        &stubPolicySource{set: policy.EmptySet()},
+		Registry:      registry.New(),
+		IPLimit:       guard.NewIPLimiter(),
+		Ban:           guard.NewFail2ban(true),
+		HostKey:       testHostKey(t),
+		Log:           discardLogger(),
+		Version:       "test",
+		AdvertiseHost: "relay.test",
+	})
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, lis) }()
+
+	// A live connection parked mid-handshake (never completes SSH auth).
+	nc, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer nc.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("Serve did not return after stop")
 	}
 }

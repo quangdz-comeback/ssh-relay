@@ -69,6 +69,13 @@ ifconfig.me at startup; set `--hostname` on air-gapped hosts) → os hostname,
 and carry `-p <port>` whenever `--listen-port` is not 22. The control shell
 exits on `Ctrl+C`/`Ctrl+D`, which tears the tunnel down.
 
+Stopping: `SIGINT`/`SIGTERM` (systemd, `docker stop`, panel stop buttons)
+shut the relay down gracefully — the listener and every live connection
+close and the process exits 0 within a 5 s grace period, so restarts are
+instant. Pterodactyl-style eggs that stop via a stdin command work too: a
+literal `stop` line on stdin triggers the same shutdown (`Ctrl+C` still
+works in an attached console).
+
 ## Status
 
 - M0–M5 implemented and covered by unit, protocol, in-process integration

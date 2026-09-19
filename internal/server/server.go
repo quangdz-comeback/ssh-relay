@@ -64,6 +64,12 @@ type Server struct {
 	authStash sync.Map // sessionID string → stashedAuth
 	sem       chan struct{}
 	wg        sync.WaitGroup
+
+	// Live connections, tracked so a stop (SIGTERM/SIGINT or the panel's
+	// stdin stop command) can tear them all down instead of waiting for
+	// idle tunnel owners to disconnect on their own.
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
 
 // stashedAuth is the end user's pass-through device login: either a ready
@@ -94,7 +100,53 @@ type stashedAuth struct {
 
 // New builds a Server.
 func New(deps Deps) *Server {
-	return &Server{deps: deps, log: deps.Log, sem: make(chan struct{}, maxConns)}
+	return &Server{deps: deps, log: deps.Log, sem: make(chan struct{}, maxConns), conns: make(map[net.Conn]struct{})}
+}
+
+// shutdownGrace bounds the stop drain: a stopping relay must exit well
+// before a panel's stop timeout (Pterodactyl SIGKILLs after its own limit).
+var shutdownGrace = 5 * time.Second
+
+// trackConn registers a live connection for shutdown-time teardown.
+func (s *Server) trackConn(nc net.Conn) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	s.conns[nc] = struct{}{}
+}
+
+// untrackConn drops a connection that finished on its own.
+func (s *Server) untrackConn(nc net.Conn) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	delete(s.conns, nc)
+}
+
+// closeConns tears down every live connection so their handlers unblock and
+// unwind during shutdown.
+func (s *Server) closeConns() {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	for nc := range s.conns {
+		nc.Close()
+	}
+}
+
+// drain waits for live handlers to unwind, bounded by shutdownGrace, and
+// always reports success: a stopped relay exits 0 even if something refuses
+// to die in time.
+func (s *Server) drain() error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		s.log.Info("relay stopped cleanly")
+	case <-time.After(shutdownGrace):
+		s.log.Warn("shutdown grace exceeded, exiting with live handlers", "grace", shutdownGrace.String())
+	}
+	return nil
 }
 
 // Serve runs until ctx is cancelled or the listener fails.
@@ -108,6 +160,9 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 	go func() {
 		<-srvCtx.Done()
 		lis.Close()
+		// Unblock live handlers (idle tunnel owners never disconnect on
+		// their own — without this a panel stop would stall to SIGKILL).
+		s.closeConns()
 	}()
 
 	for {
@@ -115,8 +170,7 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 		if err != nil {
 			select {
 			case <-srvCtx.Done():
-				s.wg.Wait()
-				return nil
+				return s.drain()
 			default:
 			}
 			return fmt.Errorf("accept: %w", err)
@@ -125,12 +179,12 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 		case s.sem <- struct{}{}:
 		case <-srvCtx.Done():
 			nc.Close()
-			s.wg.Wait()
-			return nil
+			return s.drain()
 		}
+		s.trackConn(nc)
 		s.wg.Add(1)
 		go func() {
-			defer func() { <-s.sem; s.wg.Done() }()
+			defer func() { <-s.sem; s.untrackConn(nc); s.wg.Done() }()
 			defer nc.Close()
 			s.handleConn(srvCtx, nc)
 		}()

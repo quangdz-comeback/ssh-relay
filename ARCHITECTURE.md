@@ -749,6 +749,12 @@ ProtectSystem=strict
 WantedBy=multi-user.target
 ```
 
+Pterodactyl / Wings: the binary handles both panel stop styles natively —
+the default signal stop (`SIGTERM`: graceful drain of every live connection,
+bounded at 5 s, exit 0, well before the wings SIGKILL) and eggs configured
+with a stop *command* (a literal `stop` line on stdin triggers the same
+shutdown). No wrapper script or exit-command hacks needed.
+
 DNS: a single `A/AAAA` record for `relay.example.com`. No wildcard DNS is
 needed (routing is by SSH username, not hostname).
 

@@ -111,6 +111,9 @@ func validRoutingAlias(alias string) bool {
 		switch {
 		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
 		case c == '-' && i > 0 && i < len(alias)-1:
+		// Inner underscores: matches the registration grammar so a tunnel
+		// registered as `-R u0_a96:0:…` is addressable as `u0_a96@relay`.
+		case c == '_' && i > 0 && i < len(alias)-1:
 		default:
 			return false
 		}

@@ -86,6 +86,16 @@ func TestAliasRules(t *testing.T) {
 	if err != nil || generated || a != "my-vps" {
 		t.Fatalf("custom alias: %q %v %v", a, generated, err)
 	}
+	// Inner underscores are valid (Termux/Android names like u0_a96);
+	// leading/trailing underscores stay invalid.
+	if b, err := r.Bind("u0_a96", fakeConn("d3"), "ip", "u0_a96", 1, 1); err != nil || b.Alias != "u0_a96" {
+		t.Fatalf("underscore alias: %v %v", b, err)
+	}
+	for _, bad := range []string{"_abc", "ab_"} {
+		if _, err := r.Bind(bad, owner, "ip", bad, 1, 1); err == nil {
+			t.Fatalf("invalid underscore alias %q accepted", bad)
+		}
+	}
 	// localhost means generate.
 	if _, generated, _ = NormalizeRequestedAddr("localhost"); !generated {
 		t.Fatalf("localhost must generate")

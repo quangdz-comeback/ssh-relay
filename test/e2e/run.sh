@@ -167,6 +167,31 @@ for i in 1 2 3; do
 done
 echo "$OUT" | grep -q "custom-alias-ok" || { echo "$OUT"; fail "custom alias bridge failed"; }
 note "custom alias OK"
+# Free this tunnel's per-IP session slot (limit 3) so the next scenario's
+# device registration + client fit under the cap; wait until the relay
+# unlists it, like the dead-tunnel scenario below.
+kill "$REG2_PID" 2>/dev/null
+for i in $(seq 1 50); do
+  OUT=$(env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" "json@127.0.0.1" 'true' 2>/dev/null)
+  echo "$OUT" | grep -q myvps || break
+  sleep 0.1
+done
+
+# ---------- underscore alias (Termux/Android names like u0_a96) ----------
+# The alias grammar used to reject '_', so `-R u0_a96:0:…` was refused with
+# "remote port forwarding failed". Register one and bridge through it.
+ssh "${SSH_OPTS[@]}" -T -R u0_a96:0:127.0.0.1:$PORT_SSHD ssh@127.0.0.1 > "$WORK/underbanner.txt" 2>/dev/null &
+UNDER_PID=$!
+PIDS="$PIDS $UNDER_PID"
+for i in $(seq 1 50); do grep -q "Tunnel online: u0_a96" "$WORK/underbanner.txt" 2>/dev/null && break; sleep 0.1; done
+grep -q "Tunnel online: u0_a96" "$WORK/underbanner.txt" || { cat "$WORK/underbanner.txt"; fail "underscore alias registration failed"; }
+for i in 1 2 3; do
+  OUT=$(env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" "u0_a96@127.0.0.1" 'echo underscore-alias-ok' 2>&1)
+  echo "$OUT" | grep -q "underscore-alias-ok" && break
+  sleep 0.7
+done
+echo "$OUT" | grep -q "underscore-alias-ok" || { echo "$OUT"; fail "underscore alias bridge failed"; }
+note "underscore alias (u0_a96) OK"
 
 # ---------- interactive shell must end on the device's exit ----------
 # The relay used to close the client channel only after its stdin pump saw

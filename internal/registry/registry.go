@@ -217,6 +217,9 @@ func validAliasCharset(alias string) bool {
 		switch {
 		case c >= 'a' && c <= 'z' || c >= '0' && c <= '9':
 		case c == '-' && i > 0 && i < len(alias)-1:
+		// Inner underscores: Android/Termux usernames (u0_a96, …) make
+		// natural tunnel names, and `-R <name>:0:…` must accept them.
+		case c == '_' && i > 0 && i < len(alias)-1:
 		default:
 			return false
 		}

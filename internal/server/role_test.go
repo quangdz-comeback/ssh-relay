@@ -17,13 +17,17 @@ func TestClassify(t *testing.T) {
 		{"root+d-7k2m9xq4tz", RoleClient, "root", "d-7k2m9xq4tz", false},
 		{"deploy+MyVps", RoleClient, "deploy", "myvps", false},
 		{"myvps", RoleClient, "root", "myvps", false},
-		{"www.example.com", RoleClient, "", "", true},    // dot not allowed in alias
-		{"ro ot+d-7k2m9xq4tz", RoleClient, "", "", true}, // space in user
-		{"+d-7k2m9xq4tz", RoleClient, "", "", true},      // empty user
-		{"root+", RoleClient, "", "", true},              // empty alias
-		{"root+ab", RoleClient, "", "", true},            // alias too short
-		{"root+json", RoleClient, "", "", true},          // reserved alias
-		{"help", RoleClient, "", "", true},               // reserved username
+		{"u0_a96", RoleClient, "root", "u0_a96", false},      // inner underscore (Termux)
+		{"user+u0_a96", RoleClient, "user", "u0_a96", false}, // custom user + underscore
+		{"_abc", RoleClient, "", "", true},                   // leading underscore
+		{"ab_", RoleClient, "", "", true},                    // trailing underscore
+		{"www.example.com", RoleClient, "", "", true},        // dot not allowed in alias
+		{"ro ot+d-7k2m9xq4tz", RoleClient, "", "", true},     // space in user
+		{"+d-7k2m9xq4tz", RoleClient, "", "", true},          // empty user
+		{"root+", RoleClient, "", "", true},                  // empty alias
+		{"root+ab", RoleClient, "", "", true},                // alias too short
+		{"root+json", RoleClient, "", "", true},              // reserved alias
+		{"help", RoleClient, "", "", true},                   // reserved username
 		{"a b", RoleClient, "", "", true},
 	}
 	for _, c := range cases {

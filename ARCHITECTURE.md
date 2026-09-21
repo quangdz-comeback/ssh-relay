@@ -101,8 +101,10 @@ grammar:
   username := [ device-user "+" ] alias → CLIENT role (session bridge)
 
   alias        := generated "d-" + 10 Crockford base32 chars
-                | custom name matching ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$
-                 (1–63 chars total, lowercase, no "d-" prefix)
+                | custom name matching ^[a-z0-9][a-z0-9_-]{1,61}[a-z0-9]$
+                 (1–63 chars total, lowercase, inner dash/underscore, no
+                 "d-" prefix; underscores exist so Android/Termux usernames
+                 like u0_a96 work as tunnel names)
   device-user  := ^[a-zA-Z0-9._][a-zA-Z0-9._-]{0,31}$   (default: "root")
 ```
 

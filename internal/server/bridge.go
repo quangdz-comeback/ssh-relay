@@ -62,11 +62,12 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 	wg.Add(1)
 
 	// Data pumps: exit ordering matters — after the device session ends we
-	// send exit-status, then wait for stdout/stderr to drain before closing
-	// the client channel, so no output is lost. The stdin pump ends when the
-	// client closes its side (it does after seeing exit-status).
-	var pumpWg sync.WaitGroup
+	// send exit-status, then drain the output pumps before closing the
+	// client channel, so no output is lost.
+	var pumpWg sync.WaitGroup    // all pumps
+	var outPumpWg sync.WaitGroup // device → client output pumps only
 	pumpWg.Add(3)
+	outPumpWg.Add(2)
 
 	// mirrorOne evaluates one request against policy, forwards it to the
 	// device, and relays the device's answer; refused requests get their
@@ -96,45 +97,42 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 		return true
 	}
 
-	// stdin (client → device, throttled).
-	go func() {
-		defer pumpWg.Done()
-		ioCopy(bwUp.Writer(ctx, devCh), bwUp.Reader(ctx, clientCh))
-	}()
-	// stdout (device → client, throttled).
-	go func() {
-		defer pumpWg.Done()
-		ioCopy(bwDown.Writer(ctx, clientCh), bwDown.Reader(ctx, devCh))
-	}()
-	// stderr keeps extended-data semantics.
-	go func() {
-		defer pumpWg.Done()
-		ioCopy(clientCh.Stderr(), devCh.Stderr())
-	}()
-
-	// Device → client exit mapping: exit-status/exit-signal forwarded
-	// verbatim; a device death without any exit request maps to 255. Cancel
-	// first so a throttled stdin pump cannot stall the drain.
+	// Device → client exit mapping: the first exit-status/exit-signal is
+	// relayed verbatim and ENDS the client session right away. The device
+	// connection itself may linger, and the stdin pump blocks on the user's
+	// idle terminal with no cancel path — waiting for either left openssh
+	// terminals hanging after logout until one extra keystroke. A device
+	// death without any exit request maps to 255. Ordering inside finish
+	// matters: drain the output pumps while the client channel is still
+	// open (no lost tail output), and only then close the client channel,
+	// which is also what unblocks the stdin pump.
+	var finishOnce sync.Once
+	finish := func(exitSeen bool) {
+		finishOnce.Do(func() {
+			if !exitSeen {
+				clientCh.SendRequest("exit-status", false, ssh.Marshal(exitStatusMsg{Status: 255}))
+			}
+			devCh.Close()    // ends the device stream; buffered output stays readable
+			outPumpWg.Wait() // drain every buffered byte to the client first
+			cancel()
+			clientCh.Close()
+			pumpWg.Wait()
+		})
+	}
 	go func() {
 		defer wg.Done()
-		exitSeen := false
 		for req := range devReqs {
 			switch req.Type {
 			case "exit-status", "exit-signal":
-				exitSeen = true
 				clientCh.SendRequest(req.Type, false, req.Payload)
+				finish(true)
 			default:
 				if req.WantReply {
 					req.Reply(false, nil)
 				}
 			}
 		}
-		if !exitSeen {
-			clientCh.SendRequest("exit-status", false, ssh.Marshal(exitStatusMsg{Status: 255}))
-		}
-		cancel()
-		pumpWg.Wait()
-		clientCh.Close()
+		finish(false)
 	}()
 
 	// Replay the buffered setup requests. pty-req was already answered
@@ -151,6 +149,30 @@ func (s *Server) mirrorSession(ctx context.Context, clientCh ssh.Channel, chReqs
 			break
 		}
 	}
+
+	// Data pumps start only AFTER the replay: client stdin racing ahead of
+	// the replayed shell request reached the device out of order and sshd
+	// discarded it (typed input silently lost — visible with slow device
+	// handshakes). The device's early output stays buffered on devCh until
+	// the output pump drains it, so nothing is lost the other way either.
+	//
+	// stdin (client → device, throttled).
+	go func() {
+		defer pumpWg.Done()
+		ioCopy(bwUp.Writer(ctx, devCh), bwUp.Reader(ctx, clientCh))
+	}()
+	// stdout (device → client, throttled).
+	go func() {
+		defer pumpWg.Done()
+		defer outPumpWg.Done()
+		ioCopy(bwDown.Writer(ctx, clientCh), bwDown.Reader(ctx, devCh))
+	}()
+	// stderr keeps extended-data semantics.
+	go func() {
+		defer pumpWg.Done()
+		defer outPumpWg.Done()
+		ioCopy(clientCh.Stderr(), devCh.Stderr())
+	}()
 
 	// Live requests from here on.
 	for req := range chReqs {

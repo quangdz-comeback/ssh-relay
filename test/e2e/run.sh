@@ -168,6 +168,19 @@ done
 echo "$OUT" | grep -q "custom-alias-ok" || { echo "$OUT"; fail "custom alias bridge failed"; }
 note "custom alias OK"
 
+# ---------- interactive shell must end on the device's exit ----------
+# The relay used to close the client channel only after its stdin pump saw
+# more input, so an openssh terminal hung after logout until one extra Enter.
+# Feed `exit` through a forced PTY and require the client to exit on its own:
+# a hang would only end via the 20s timeout (rc=124).
+OUT=$(echo exit | timeout 20 env "${CLIENT_ENV[@]}" setsid ssh "${SSH_OPTS[@]}" -tt "root+$ALIAS@127.0.0.1" 2>&1)
+RC=$?
+if [ "$RC" -gt 1 ]; then
+  echo "$OUT"
+  fail "interactive shell did not exit on its own (rc=$RC)"
+fi
+note "interactive shell exits without extra keystroke OK"
+
 # ---------- pubkey pass-through via agent forwarding (M6) ----------
 # The device accepts a key the user keeps in an agent; the relay forwards the
 # agent so the device verifies the real key (ARCHITECTURE §5). The agent below

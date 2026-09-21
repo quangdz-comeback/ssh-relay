@@ -304,7 +304,9 @@ func (s *Server) serverConfig() *ssh.ServerConfig {
 				// during auth, so it must name the real problem: a dead
 				// tunnel used to fall through to a pointless password loop.
 				instruction, canProceed := s.deviceChallengeInstruction(md, cls)
-				answers, err := challenger(md.User(), instruction, []string{"Password:"}, []bool{true})
+				// echo=false: the client masks the answer (*******); raw
+				// display would leak device passwords to shoulder surfers.
+				answers, err := challenger(md.User(), instruction, []string{"Password:"}, []bool{false})
 				if err != nil || len(answers) == 0 {
 					return nil, fmt.Errorf("no answer provided")
 				}

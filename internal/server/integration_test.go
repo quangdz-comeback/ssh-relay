@@ -542,6 +542,82 @@ func TestPubkeyAgentBridgeExec(t *testing.T) {
 	}
 }
 
+// TestPasswordPromptIsMasked: the keyboard-interactive challenge must ask
+// the client NOT to echo the answer — raw display leaks device passwords.
+func TestPasswordPromptIsMasked(t *testing.T) {
+	h := newHarness(t, nil)
+	dev := &fakeDevice{}
+	alias := h.registerDevice(t, dev, "")
+
+	var echoes []bool
+	challenger := ssh.KeyboardInteractive(func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+		echoes = append(echoes, echos...)
+		return []string{"devpass"}, nil
+	})
+	client, err := h.clientDialAuth("root+"+alias, []ssh.AuthMethod{challenger})
+	if err != nil {
+		t.Fatalf("keyboard-interactive auth: %v", err)
+	}
+	defer client.Close()
+	if len(echoes) == 0 {
+		t.Fatalf("relay never issued a password prompt")
+	}
+	for i, e := range echoes {
+		if e {
+			t.Fatalf("password prompt #%d must not echo (raw display)", i)
+		}
+	}
+}
+
+// TestInteractiveSessionEndsWithoutKeystroke: once the device sends
+// exit-status the relay must close the client session immediately — the
+// device connection may linger and the user will not press another key.
+// (openssh interactive shells wait for the channel close; waiting for the
+// stdin pump left the terminal hanging until one more Enter.)
+func TestInteractiveSessionEndsWithoutKeystroke(t *testing.T) {
+	h := newHarness(t, nil)
+	dev := &fakeDevice{}
+	alias := h.registerDevice(t, dev, "")
+
+	client, err := h.clientDial("root+"+alias, "devpass")
+	if err != nil {
+		t.Fatalf("client auth: %v", err)
+	}
+	defer client.Close()
+
+	// Raw channel (not ssh.Session): Session.Wait returns on exit-status and
+	// would hide a missing channel close; an interactive shell sees EOF only
+	// when the relay closes the channel.
+	ch, _, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatalf("session channel: %v", err)
+	}
+	defer ch.Close()
+	if ok, err := ch.SendRequest("shell", true, nil); err != nil || !ok {
+		t.Fatalf("shell request: ok=%v err=%v", ok, err)
+	}
+
+	// The device answers with output + exit-status + device-side close, but
+	// keeps its CONNECTION open (fakeDevice does). No further client input
+	// is sent — the EOF below must arrive on the relay's initiative.
+	ended := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := ch.Read(buf); err != nil {
+				ended <- err
+				return
+			}
+		}
+	}()
+	select {
+	case <-ended:
+		// session closed without any extra keystroke ✓
+	case <-time.After(5 * time.Second):
+		t.Fatal("client session did not end after the device exit-status (needs an extra keystroke)")
+	}
+}
+
 // TestPubkeyWithoutAgent: no forwarded agent → the deferred device login
 // cannot complete; the user gets exit 255 and actionable stderr.
 func TestPubkeyWithoutAgent(t *testing.T) {
